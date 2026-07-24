@@ -75,6 +75,8 @@ class InferenceContext:
     def init_dynamic_mtp_planner(self, mtp_step: int, mode: str = None):
         if mode == "dspark":
             planner_mode = "dspark"
+        elif mode == "dflash":
+            planner_mode = "dflash"
         elif mode == "eagle3":
             planner_mode = "eagle3"
         else:
@@ -87,6 +89,7 @@ class InferenceContext:
             return
 
         from lightllm.server.router.model_infer.speculative.planner import (
+            DFlashDynamicMTPPlanner,
             DSparkDynamicMTPPlanner,
             DynamicMTPPlanner,
             Eagle3DynamicMTPPlanner,
@@ -94,6 +97,7 @@ class InferenceContext:
 
         planner_cls = {
             "default": DynamicMTPPlanner,
+            "dflash": DFlashDynamicMTPPlanner,
             "dspark": DSparkDynamicMTPPlanner,
             "eagle3": Eagle3DynamicMTPPlanner,
         }[planner_mode]

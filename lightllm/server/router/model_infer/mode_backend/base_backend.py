@@ -43,6 +43,7 @@ from lightllm.common.speculative import (
     is_gemma4_dspark_draft_config,
     is_qwen3_dflash_draft_config,
     is_qwen3_dspark_draft_config,
+    validate_dspark_family_draft_config,
 )
 from lightllm.server.router.model_infer.speculative import build_spec_runtime
 from lightllm.distributed.communication_op import (
@@ -650,11 +651,15 @@ class ModeBackend:
         if not self.spec_config.uses_block_draft_model:
             return
 
-        block_size = get_dspark_family_block_size(
-            mtp_model_cfg,
-            require_confidence_head=self.spec_config.is_dspark,
-        )
         configured_step = int(getattr(self.args, "mtp_step", 0))
+        if self.spec_config.is_dflash and configured_step > 0:
+            validate_dspark_family_draft_config(mtp_model_cfg, require_block_size=False)
+            block_size = configured_step
+        else:
+            block_size = get_dspark_family_block_size(
+                mtp_model_cfg,
+                require_confidence_head=self.spec_config.is_dspark,
+            )
         if configured_step not in (0, block_size):
             self.logger.warning(
                 "Overriding mtp_step=%s with block draft config block_size=%s for %s mode",

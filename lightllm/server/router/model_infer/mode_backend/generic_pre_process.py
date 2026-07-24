@@ -99,7 +99,9 @@ def prepare_prefill_inputs(req_objs: List[InferReq], is_chuncked_mode: bool) -> 
     return model_input, run_reqs
 
 
-def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[InferReq]]:
+def prepare_decode_inputs(
+    req_objs: List[InferReq], *, allocate_mem_indexes: bool = True
+) -> Tuple[ModelInput, List[InferReq]]:
     run_reqs: List[InferReq] = []
     total_token_num = 0
     b_req_idx = []
@@ -147,10 +149,12 @@ def prepare_decode_inputs(req_objs: List[InferReq]) -> Tuple[ModelInput, List[In
         b_shared_seq_len = None
         b_mark_shared_group = None
 
-    # dynamic prompt cache 准备 token
-    if g_infer_context.radix_cache is not None:
-        g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(b_seq_len.shape[0])
-    mem_indexes = g_infer_context.req_manager.mem_manager.alloc(b_seq_len.shape[0])
+    mem_indexes = None
+    if allocate_mem_indexes:
+        # dynamic prompt cache 准备 token
+        if g_infer_context.radix_cache is not None:
+            g_infer_context.radix_cache.free_radix_cache_to_get_enough_token(b_seq_len.shape[0])
+        mem_indexes = g_infer_context.req_manager.mem_manager.alloc(b_seq_len.shape[0])
 
     model_input = ModelInput(
         batch_size=b_seq_len.shape[0],

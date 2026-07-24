@@ -65,11 +65,19 @@ class Qwen3DFlashModel(LlamaTpPartModel):
         kvargs["return_all_prompt_logics"] = True
         return
 
+    def _init_config(self):
+        super()._init_config()
+        runtime_block_size = int(self.args.mtp_step)
+        assert runtime_block_size > 0
+        self.config["block_size"] = runtime_block_size
+        return
+
     def _init_custom(self):
         self._cos_cached = self.main_model._cos_cached
         self._sin_cached = self.main_model._sin_cached
         self.dist_group = dist_group_manager.get_default_group()
         self.block_size = int(self.config["block_size"])
+        assert self.block_size > 0
         self.mask_token_id = int(self.config["mask_token_id"])
         return
 

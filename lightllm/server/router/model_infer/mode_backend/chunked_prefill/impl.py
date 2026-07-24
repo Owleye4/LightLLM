@@ -238,21 +238,38 @@ class ChunkedPrefillBackend(ModeBackend):
         """
         MTP解码的通用流程，整合eagle和vanilla的共同逻辑
         """
-        host_start = time.perf_counter()
-        model_input, run_reqs = prepare_decode_inputs(decode_reqs)
-        self.record_mtp_phase_cpu(
-            phase="prepare_decode_inputs_host",
-            wall_seconds=time.perf_counter() - host_start,
-        )
         spec_runtime = self.spec_adapter
-
-        with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+        spec_plan = None
+        full_verify_rows = len(decode_reqs) * (self.mtp_step + 1)
+        if spec_runtime.uses_dflash_direct_prepare:
             host_start = time.perf_counter()
-            spec_plan = spec_runtime.plan_decode(model_input=model_input, req_num=len(decode_reqs))
+            spec_plan = spec_runtime.plan_decode_shape(
+                req_num=len(decode_reqs),
+                original_batch_size=full_verify_rows,
+            )
             self.record_mtp_phase_cpu(
                 phase="planner_host",
                 wall_seconds=time.perf_counter() - host_start,
             )
+
+        host_start = time.perf_counter()
+        model_input, run_reqs = prepare_decode_inputs(
+            decode_reqs,
+            allocate_mem_indexes=not spec_runtime.uses_dflash_direct_prepare,
+        )
+        self.record_mtp_phase_cpu(
+            phase="prepare_decode_inputs_host",
+            wall_seconds=time.perf_counter() - host_start,
+        )
+
+        with torch.cuda.stream(g_infer_context.get_overlap_stream()):
+            if spec_plan is None:
+                host_start = time.perf_counter()
+                spec_plan = spec_runtime.plan_decode(model_input=model_input, req_num=len(decode_reqs))
+                self.record_mtp_phase_cpu(
+                    phase="planner_host",
+                    wall_seconds=time.perf_counter() - host_start,
+                )
 
             full_verify_rows = int(model_input.batch_size)
             phase_timer = self.start_mtp_phase_gpu()

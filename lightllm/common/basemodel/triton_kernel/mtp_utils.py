@@ -376,6 +376,7 @@ def _trim_decode_model_input_inplace(
     model_input: ModelInput,
     selected_mask_gpu: torch.Tensor,
     dynamic_batch_size: int,
+    compact_mem_indexes: Optional[torch.Tensor] = None,
 ) -> ModelInput:
     assert not model_input.is_prefill
     assert selected_mask_gpu.is_cuda
@@ -420,14 +421,21 @@ def _trim_decode_model_input_inplace(
             device=model_input.b_position_delta.device,
         )
 
-    out_mem_indexes = None
-    if model_input.mem_indexes is not None:
-        assert model_input.mem_indexes.is_cuda
+    source_mem_indexes = model_input.mem_indexes
+    if compact_mem_indexes is not None:
+        assert compact_mem_indexes.is_cuda
+        assert compact_mem_indexes.shape[0] == dynamic_batch_size
+        source_mem_indexes = None
+        out_mem_indexes = compact_mem_indexes
+    elif source_mem_indexes is not None:
+        assert source_mem_indexes.is_cuda
         out_mem_indexes = torch.empty(
             (dynamic_batch_size,),
-            dtype=model_input.mem_indexes.dtype,
-            device=model_input.mem_indexes.device,
+            dtype=source_mem_indexes.dtype,
+            device=source_mem_indexes.device,
         )
+    else:
+        out_mem_indexes = None
 
     dummy_1d = model_input.b_req_idx
     BLOCK_SIZE = triton.next_power_of_2(old_batch_size)
@@ -443,7 +451,7 @@ def _trim_decode_model_input_inplace(
         out_b_seq_len=out_b_seq_len,
         b_position_delta=model_input.b_position_delta if model_input.b_position_delta is not None else dummy_1d,
         out_b_position_delta=out_b_position_delta if out_b_position_delta is not None else dummy_1d,
-        mem_indexes=model_input.mem_indexes if model_input.mem_indexes is not None else dummy_1d,
+        mem_indexes=source_mem_indexes if source_mem_indexes is not None else dummy_1d,
         out_mem_indexes=out_mem_indexes if out_mem_indexes is not None else dummy_1d,
         b_shared_seq_len=model_input.b_shared_seq_len if model_input.b_shared_seq_len is not None else dummy_1d,
         out_b_shared_seq_len=out_b_shared_seq_len if out_b_shared_seq_len is not None else dummy_1d,
@@ -452,7 +460,7 @@ def _trim_decode_model_input_inplace(
         batch_size=old_batch_size,
         HAS_INPUT_IDS=model_input.input_ids is not None,
         HAS_B_POSITION_DELTA=model_input.b_position_delta is not None,
-        HAS_MEM_INDEXES=model_input.mem_indexes is not None,
+        HAS_MEM_INDEXES=source_mem_indexes is not None,
         HAS_B_SHARED_SEQ_LEN=model_input.b_shared_seq_len is not None,
         BLOCK_SIZE=BLOCK_SIZE,
         num_warps=8,
@@ -493,6 +501,7 @@ def prepare_dynamic_mtp_model_input(
     dynamic_batch_size: int,
     req_to_next_token_ids: torch.Tensor,
     req_to_next_token_probs: Optional[torch.Tensor] = None,
+    compact_mem_indexes_cpu: Optional[torch.Tensor] = None,
 ):
     if req_to_next_token_probs is None:
         selected_mask = torch.ones((model_input.batch_size,), dtype=torch.int32, device="cuda")
@@ -508,6 +517,15 @@ def prepare_dynamic_mtp_model_input(
 
     # ! 在一个CUDA流上面的GPU操作会自动串行化，因此不需要额外同步
     # ! model_input必须在GPU上，才能高效进行trim操作
+    compact_mem_indexes = None
+    if compact_mem_indexes_cpu is not None:
+        assert model_input.mem_indexes_cpu is None
+        assert compact_mem_indexes_cpu.shape[0] == dynamic_batch_size
+        compact_mem_indexes = compact_mem_indexes_cpu.cuda(non_blocking=True)
+        # ModelInput.to_cuda() normally owns this copy. In the direct DFlash
+        # path the compact allocation has K rows while the logical selection
+        # input still has B*(S+1), so bind it only after row selection.
+        model_input.mem_indexes = compact_mem_indexes
     model_input.to_cuda()
 
     selected_mask_gpu = sample_dynamic_mtp_req_mask(
@@ -521,7 +539,10 @@ def prepare_dynamic_mtp_model_input(
         model_input=model_input,
         selected_mask_gpu=selected_mask_gpu,
         dynamic_batch_size=dynamic_batch_size,
+        compact_mem_indexes=compact_mem_indexes,
     )
+    if compact_mem_indexes_cpu is not None:
+        model_input.mem_indexes_cpu = compact_mem_indexes_cpu
     # Keep CPU mem_indexes unfiltered here.  Copying selected_mask_gpu back to
     # CPU in this hot path synchronizes the overlap stream; the router frees
     # unselected/rejected CPU mem indexes after its existing async mask copy is

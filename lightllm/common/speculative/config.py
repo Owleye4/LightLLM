@@ -32,8 +32,6 @@ class SpeculativeConfig:
             dynamic_verify = bool(getattr(args, "mtp_dynamic_verify", False))
         if mode == "dspark":
             dynamic_verify = True
-        elif mode == "dflash":
-            dynamic_verify = False
         return cls(
             mode=mode,
             step=int(getattr(args, "mtp_step", 0)),
@@ -152,13 +150,15 @@ def validate_dspark_family_draft_config(
     config: Mapping[str, Any],
     *,
     require_confidence_head: bool = False,
+    require_block_size: bool = True,
 ) -> None:
     """Validate DFlash/DSpark checkpoint fields consumed by LightLLM serving."""
 
     assert is_dspark_draft_config(config), f"unsupported DFlash/DSpark architecture: {config.get('architectures')}"
 
-    block_size = int(config.get("block_size", 0))
-    assert block_size > 0, "DFlash/DSpark draft config must provide positive block_size"
+    if require_block_size:
+        block_size = int(config.get("block_size", 0))
+        assert block_size > 0, "DFlash/DSpark draft config must provide positive block_size"
 
     target_layer_ids = config.get("target_layer_ids")
     assert (

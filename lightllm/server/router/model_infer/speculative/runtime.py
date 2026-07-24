@@ -3,9 +3,11 @@ from __future__ import annotations
 import collections
 import json
 import os
+import threading
 from typing import Callable, List, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 
 from lightllm.common.basemodel.batch_objs import ModelInput, ModelOutput
 from lightllm.common.speculative.config import SpeculativeConfig
@@ -46,6 +48,23 @@ class SpecRuntime:
         self.proposer = build_spec_proposer(self)
         self.decode_runner = SpecDecodeRunner(self)
         self.planner = self._build_decode_planner()
+
+        self._dflash_commit_cost_events = collections.deque()
+        self._dflash_commit_cost_pending = set()
+        self._dflash_block_cost_events = collections.deque()
+        self._dflash_block_cost_pending = False
+        self._dflash_one_step_ahead = (
+            os.getenv("LIGHTLLM_DFLASH_ONE_STEP_AHEAD", "1").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._dflash_direct_prepare = (
+            os.getenv("LIGHTLLM_DFLASH_DIRECT_PREPARE", "1").lower()
+            in {"1", "true", "yes", "on"}
+        )
+        self._dflash_next_plans = {}
+        self._dflash_next_plan_lock = threading.Lock()
+        self._dflash_next_plan_hits = 0
+        self._dflash_next_plan_misses = 0
 
     @property
     def spec_config(self) -> SpeculativeConfig:
@@ -271,9 +290,14 @@ class SpecRuntime:
         return ("spec", self.spec_config.mode, role, disable_mtp_decode_att)
 
     def get_decode_graph_mtp_step(self, model) -> int:
+        is_draft_model = any(model is draft_model for draft_model in self.backend.draft_models)
+        if self.spec_config.uses_block_draft_model and is_draft_model:
+            runtime_block_size = int(getattr(model, "block_size", 0))
+            assert runtime_block_size > 0
+            return runtime_block_size - 1
         return self.spec_config.get_decode_graph_mtp_step(
             model_config=model.config,
-            is_draft_model=any(model is draft_model for draft_model in self.backend.draft_models),
+            is_draft_model=is_draft_model,
         )
 
     def export_graph_capture(self):
@@ -308,10 +332,137 @@ class SpecRuntime:
         )
         return
 
+    def start_dflash_commit_cost(self, *, batch_size: int):
+        if not self.enable_dynamic_mtp or not self.spec_config.is_dflash:
+            return None
+        has_commit_cost = getattr(self.planner, "has_commit_cost", None)
+        if has_commit_cost is None or has_commit_cost(batch_size):
+            return None
+        batch_size = int(batch_size)
+        if batch_size in self._dflash_commit_cost_pending:
+            return None
+        self._dflash_commit_cost_pending.add(batch_size)
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        return batch_size, start_event
+
+    def finish_dflash_commit_cost(self, timer) -> None:
+        if timer is None:
+            return
+        batch_size, start_event = timer
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._dflash_commit_cost_events.append((batch_size, start_event, end_event))
+
+    def start_dflash_block_cost(self, *, block_rows: int):
+        if not self.enable_dynamic_mtp or not self.spec_config.is_dflash:
+            return None
+        should_sample = getattr(self.planner, "should_sample_block_cost", None)
+        if should_sample is None or not should_sample(block_rows) or self._dflash_block_cost_pending:
+            return None
+        self._dflash_block_cost_pending = True
+        start_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        return int(block_rows), start_event
+
+    def finish_dflash_block_cost(self, timer) -> None:
+        if timer is None:
+            return
+        block_rows, start_event = timer
+        end_event = torch.cuda.Event(enable_timing=True)
+        end_event.record()
+        self._dflash_block_cost_events.append((block_rows, start_event, end_event))
+
+    def _drain_dflash_costs(self, *, synchronize: bool) -> None:
+        update_commit_cost = getattr(self.planner, "update_commit_cost", None)
+        while update_commit_cost is not None and self._dflash_commit_cost_events:
+            batch_size, start_event, end_event = self._dflash_commit_cost_events.popleft()
+            if not synchronize and not end_event.query():
+                self._dflash_commit_cost_events.appendleft((batch_size, start_event, end_event))
+                break
+            if synchronize:
+                end_event.synchronize()
+            infer_cost_ms = float(start_event.elapsed_time(end_event))
+            if dist.is_available() and dist.is_initialized():
+                cost = torch.tensor([infer_cost_ms], dtype=torch.float32, device="cuda")
+                dist.all_reduce(cost, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                infer_cost_ms = float(cost.item())
+            update_commit_cost(batch_size=batch_size, infer_cost_ms=infer_cost_ms)
+            self._dflash_commit_cost_pending.discard(batch_size)
+
+        update_block_cost = getattr(self.planner, "update_block_cost", None)
+        while update_block_cost is not None and self._dflash_block_cost_events:
+            block_rows, start_event, end_event = self._dflash_block_cost_events.popleft()
+            if not synchronize and not end_event.query():
+                self._dflash_block_cost_events.appendleft((block_rows, start_event, end_event))
+                break
+            if synchronize:
+                end_event.synchronize()
+            infer_cost_ms = float(start_event.elapsed_time(end_event))
+            if dist.is_available() and dist.is_initialized():
+                cost = torch.tensor([infer_cost_ms], dtype=torch.float32, device="cuda")
+                dist.all_reduce(cost, op=dist.ReduceOp.MAX, group=dist.group.WORLD)
+                infer_cost_ms = float(cost.item())
+            update_block_cost(block_rows=block_rows, infer_cost_ms=infer_cost_ms)
+            self._dflash_block_cost_pending = False
+
+    @property
+    def uses_dflash_direct_prepare(self) -> bool:
+        return self._dflash_direct_prepare and self.enable_dynamic_mtp and self.spec_config.is_dflash
+
+    @property
+    def uses_dflash_one_step_ahead(self) -> bool:
+        return (
+            self._dflash_one_step_ahead
+            and self.enable_dynamic_mtp
+            and self.spec_config.is_dflash
+            and callable(getattr(self.planner, "preview_plan", None))
+            and callable(getattr(self.planner, "commit_scheduled_plan", None))
+        )
+
+    def plan_decode_shape(self, *, req_num: int, original_batch_size: int) -> SpecDecodePlan:
+        """Plan from the logical full-width shape before allocating target KV."""
+
+        self._drain_dflash_costs(synchronize=not self.uses_dflash_one_step_ahead)
+        if self.uses_dflash_one_step_ahead:
+            key = (int(req_num), int(original_batch_size))
+            with self._dflash_next_plan_lock:
+                plan = self._dflash_next_plans.pop(key, None)
+            if plan is not None:
+                self._dflash_next_plan_hits += 1
+                commit_scheduled_plan = getattr(self.planner, "commit_scheduled_plan")
+                return commit_scheduled_plan(
+                    req_num=req_num,
+                    original_batch_size=original_batch_size,
+                    scheduled_plan=plan,
+                )
+            self._dflash_next_plan_misses += 1
+        return self.planner.plan(req_num=req_num, original_batch_size=original_batch_size)
+
     def plan_decode(self, *, model_input: ModelInput, req_num: int) -> SpecDecodePlan:
         """Return the static or dynamic MTP plan for one decode iteration."""
 
-        return self.planner.plan(req_num=req_num, original_batch_size=model_input.batch_size)
+        return self.plan_decode_shape(
+            req_num=req_num,
+            original_batch_size=model_input.batch_size,
+        )
+
+    def schedule_next_dflash_plan(self, *, req_num: int, original_batch_size: int) -> None:
+        """Compute a future DFlash budget on the overlapped post thread."""
+
+        if not self.uses_dflash_one_step_ahead or req_num <= 0:
+            return
+        self._drain_dflash_costs(synchronize=False)
+        key = (int(req_num), int(original_batch_size))
+        preview_plan = getattr(self.planner, "preview_plan")(
+            req_num=req_num,
+            original_batch_size=original_batch_size,
+        )
+        with self._dflash_next_plan_lock:
+            # A shape can recur after newer verify feedback has arrived. Keep
+            # the newest preview instead of letting an unconsumed stale entry
+            # pin that shape indefinitely.
+            self._dflash_next_plans[key] = preview_plan
 
     def run_decode_speculative_forward(
         self,
@@ -351,7 +502,12 @@ class SpecRuntime:
         req_num: int,
         run_reqs: List,
     ) -> SpecDecodePostState:
-        return self.decode_runner.finish_post(state=state, req_num=req_num, run_reqs=run_reqs)
+        post_state = self.decode_runner.finish_post(state=state, req_num=req_num, run_reqs=run_reqs)
+        self.schedule_next_dflash_plan(
+            req_num=req_num,
+            original_batch_size=req_num * (self.backend.mtp_step + 1),
+        )
+        return post_state
 
     def prepare_decode_model_input(
         self,
@@ -369,12 +525,17 @@ class SpecRuntime:
 
         from lightllm.common.basemodel.triton_kernel.mtp_utils import prepare_dynamic_mtp_model_input
 
+        compact_mem_indexes_cpu = None
+        if self.uses_dflash_direct_prepare and model_input.mem_indexes_cpu is None:
+            compact_mem_indexes_cpu = self.alloc_extra_mem_indexes(plan.dynamic_batch_size)
+
         model_input, selected_run_reqs = prepare_dynamic_mtp_model_input(
             model_input=model_input,
             req_num=req_num,
             dynamic_batch_size=plan.dynamic_batch_size,
             req_to_next_token_ids=self.backend.model.req_manager.req_sampling_params_manager.req_to_next_token_ids,
             req_to_next_token_probs=self.backend.model.req_manager.req_sampling_params_manager.req_to_next_token_probs,
+            compact_mem_indexes_cpu=compact_mem_indexes_cpu,
         )
         return model_input, selected_run_reqs
 
@@ -424,6 +585,12 @@ class SpecRuntime:
         assert selected_run_reqs_cpu is not None
         selected_mask = selected_run_reqs_cpu.to(dtype=torch.bool)
         accepted_mask = accepted_index_cpu.to(dtype=torch.bool)
+        # Direct DFlash preparation allocates only the K selected target rows.
+        # Their order already matches accepted_index_cpu, so there are no
+        # unselected target slots to release.
+        if mem_indexes_cpu.shape[0] == accepted_mask.shape[0]:
+            return mem_indexes_cpu[~accepted_mask]
+
         selected_mem_indexes_cpu = mem_indexes_cpu[selected_mask]
         assert selected_mem_indexes_cpu.shape[0] == accepted_mask.shape[0]
 
@@ -467,7 +634,7 @@ class SpecRuntime:
             req_num=req_num,
             dynamic_batch_size=dynamic_batch_size,
             accept_ratio=accept_count / total_count,
-            **({"verify_step": verify_step} if self.planner.planner_mode == "eagle3" else {}),
+            **({"verify_step": verify_step} if self.planner.planner_mode in ("eagle3", "dflash") else {}),
         )
 
         update_full_verify_tokens_per_req = getattr(
@@ -495,7 +662,7 @@ class SpecRuntime:
                 req_num=req_num,
             )
 
-        # Eagle3 uses these values as an unbiased survival curve.  Updating it
+        # Feedback-controlled planners use these values as an unbiased survival curve. Updating it
         # from confidence-selected dynamic rows would bias every depth upward;
         # full-width warmup/probe iterations are the valid samples.
         update_verified_batch_prefix_stats = getattr(
@@ -509,7 +676,7 @@ class SpecRuntime:
                     (verify_len, id_to_accept_len[req_idx]) for req_idx, verify_len in id_to_verify_len.items()
                 ],
             )
-        elif self.planner.planner_mode != "eagle3":
+        elif self.planner.planner_mode not in ("eagle3", "dflash"):
             for req_idx, verify_len in id_to_verify_len.items():
                 accept_len = id_to_accept_len[req_idx]
                 self.planner.update_verified_prefix_stats(

@@ -28,7 +28,11 @@ from lightllm.utils.config_utils import (
     auto_set_fused_shared_experts,
 )
 from lightllm.utils.dist_check_utils import auto_configure_allreduce_flags_from_args
-from lightllm.common.speculative import SpeculativeConfig, get_dspark_family_block_size
+from lightllm.common.speculative import (
+    SpeculativeConfig,
+    get_dspark_family_block_size,
+    validate_dspark_family_draft_config,
+)
 
 logger = init_logger(__name__)
 
@@ -39,11 +43,15 @@ def normalize_block_mtp_step_from_first_draft_config(args, spec_config: Speculat
 
     assert args.mtp_draft_model_dir is not None and len(args.mtp_draft_model_dir) > 0
     mtp_model_cfg, _ = PretrainedConfig.get_config_dict(args.mtp_draft_model_dir[0])
-    block_size = get_dspark_family_block_size(
-        mtp_model_cfg,
-        require_confidence_head=spec_config.is_dspark,
-    )
     configured_step = int(args.mtp_step)
+    if spec_config.is_dflash and configured_step > 0:
+        validate_dspark_family_draft_config(mtp_model_cfg, require_block_size=False)
+        block_size = configured_step
+    else:
+        block_size = get_dspark_family_block_size(
+            mtp_model_cfg,
+            require_confidence_head=spec_config.is_dspark,
+        )
     if configured_step not in (0, block_size):
         logger.warning(
             "Overriding mtp_step=%s with block draft config block_size=%s for %s mode",

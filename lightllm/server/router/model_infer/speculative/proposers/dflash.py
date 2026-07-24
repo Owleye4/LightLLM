@@ -72,10 +72,11 @@ class DFlashProposer(BaseSpecProposer):
         token_ids[:, 0] = next_token_ids
 
         if draft_step == 0:
+            empty_probs = [] if self.enable_dynamic_mtp else None
             return SpecProposal(
                 token_ids=token_ids,
                 extra_mem_indexes_cpu=None,
-                draft_probs=None,
+                draft_probs=empty_probs,
             )
 
         self.extend_draft_kv_cache(main_model_input=main_model_input)
@@ -92,17 +93,41 @@ class DFlashProposer(BaseSpecProposer):
             selected_rows=selected_rows,
             num_reqs=num_reqs,
         )
+        block_timer = self.runtime.start_dflash_block_cost(block_rows=num_reqs * block_size)
         draft_model_output = draft_model.forward(draft_input)
 
-        flat_token_ids = self.backend._gen_argmax_token_ids(draft_model_output)
+        draft_probs = None
+        if self.enable_dynamic_mtp:
+            flat_token_ids, flat_probs = self.backend._gen_argmax_token_ids_and_prob(draft_model_output)
+        else:
+            flat_token_ids = self.backend._gen_argmax_token_ids(draft_model_output)
         assert flat_token_ids.numel() == num_reqs * block_size
         block_token_ids = flat_token_ids.reshape(num_reqs, block_size)
         token_ids[selected_rows, 1:] = block_token_ids[:, :draft_step]
+        if self.enable_dynamic_mtp:
+            block_probs = flat_probs.reshape(num_reqs, block_size)
+            draft_probs = self._scatter_step_probs(
+                selected_rows=selected_rows,
+                probs=block_probs[:, :draft_step],
+                verify_row_count=next_token_ids.shape[0],
+            )
+        self.runtime.finish_dflash_block_cost(block_timer)
         return SpecProposal(
             token_ids=token_ids,
             extra_mem_indexes_cpu=draft_mem_indexes_cpu,
-            draft_probs=None,
+            draft_probs=draft_probs,
         )
+
+    def _scatter_step_probs(
+        self,
+        *,
+        selected_rows: torch.Tensor,
+        probs: torch.Tensor,
+        verify_row_count: int,
+    ) -> torch.Tensor:
+        out = probs.new_zeros((verify_row_count, probs.shape[1]), dtype=torch.float32)
+        out[selected_rows, :] = probs.float().clamp(min=0.01, max=0.99)
+        return out
 
     def extend_draft_kv_cache(self, *, main_model_input: ModelInput) -> None:
         target_hidden = self.runtime.get_hidden()
@@ -125,7 +150,9 @@ class DFlashProposer(BaseSpecProposer):
         draft_kv_input.b_position_delta = None
         draft_kv_input.b_prefill_has_output_cpu = [False for _ in range(batch_size)]
         draft_kv_input.mtp_draft_input_hiddens = target_hidden
+        commit_timer = self.runtime.start_dflash_commit_cost(batch_size=batch_size)
         draft_model.forward(draft_kv_input)
+        self.runtime.finish_dflash_commit_cost(commit_timer)
         return
 
     def build_block_draft_input(

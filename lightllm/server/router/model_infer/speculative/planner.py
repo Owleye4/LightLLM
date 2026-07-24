@@ -955,6 +955,242 @@ class Eagle3DynamicMTPPlanner(DynamicMTPPlanner):
         return total_time_ms / expected_token_num
 
 
+class DFlashDynamicMTPPlanner(Eagle3DynamicMTPPlanner):
+    """Runtime-aware verify-budget planner for fixed-width DFlash blocks."""
+
+    planner_mode = "dflash"
+
+    def __init__(self, mtp_step: int) -> None:
+        super().__init__(mtp_step=mtp_step)
+        self.commit_model_speeds = _InferCostMsTable()
+        self._min_static_progress_ratio = float(
+            os.getenv("LIGHTLLM_DFLASH_MIN_STATIC_PROGRESS_RATIO", "0.85")
+        )
+        self._min_project_accept_ratio = float(
+            os.getenv(
+                "LIGHTLLM_DFLASH_MIN_PROJECT_ACCEPT_RATIO",
+                os.getenv("LIGHTLLM_DFLASH_MIN_DRAFT_ACCEPT_RATIO", "0.860"),
+            )
+        )
+        self._full_verify_warmup_steps = max(
+            0, int(os.getenv("LIGHTLLM_DFLASH_FULL_VERIFY_WARMUP_STEPS", "32"))
+        )
+        self._full_verify_interval = max(
+            0, int(os.getenv("LIGHTLLM_DFLASH_FULL_VERIFY_INTERVAL", "128"))
+        )
+        self._progress_relax_ratio = float(
+            os.getenv("LIGHTLLM_DFLASH_PROGRESS_RELAX_RATIO", "1.0")
+        )
+        self._capacity_accept_ratio_floor = float(
+            os.getenv("LIGHTLLM_DFLASH_CAPACITY_ACCEPT_RATIO_FLOOR", "0.80")
+        )
+        self._align_verify_rows_to_graph = os.getenv(
+            "LIGHTLLM_DFLASH_ALIGN_VERIFY_ROWS_TO_GRAPH", "1"
+        ).lower() in {"1", "true", "yes", "on"}
+        self._plan_log_interval = max(
+            0, int(os.getenv("LIGHTLLM_DFLASH_PLAN_LOG_INTERVAL", "0"))
+        )
+        self._max_dynamic_draft_step = self.mtp_step
+
+    def update_commit_cost(self, *, batch_size: int, infer_cost_ms: float) -> None:
+        self.commit_model_speeds.update(batch_size=batch_size, infer_cost_ms=infer_cost_ms)
+
+    def has_commit_cost(self, batch_size: int) -> bool:
+        return self.commit_model_speeds.has_batch_size(batch_size)
+
+    def get_dflash_candidate_batch_sizes(self, *, req_num: int) -> List[int]:
+        req_num = int(req_num)
+        if req_num <= 0:
+            return []
+        max_batch_size = req_num * (self.mtp_step + 1)
+        candidates = set(self.main_model_speeds.get_batch_size_keys_between(req_num, max_batch_size))
+        candidates.add(req_num)
+        candidates.add(max_batch_size)
+        return sorted(candidates)
+
+    def should_sample_block_cost(self, block_rows: int) -> bool:
+        return not self.draft_model_speeds.has_batch_size(block_rows)
+
+    def update_block_cost(self, *, block_rows: int, infer_cost_ms: float) -> None:
+        self.update_infer_cost(batch_size=block_rows, infer_cost_ms=infer_cost_ms, is_draft_model=True)
+
+    def preview_plan(self, *, req_num: int, original_batch_size: int) -> SpecDecodePlan:
+        """Predict a future DFlash budget without advancing planner state."""
+
+        assert req_num * (self.mtp_step + 1) == original_batch_size
+        if req_num <= 0:
+            dynamic_batch_size = 0
+        else:
+            full_batch_size = req_num * (self.mtp_step + 1)
+            block_rows = req_num * self.mtp_step
+            costs_ready = (
+                self.main_model_speeds.has_data()
+                and self.commit_model_speeds.has_data()
+                and self.draft_model_speeds.has_data()
+            )
+            if not costs_ready or self._full_verify_update_count < self._full_verify_warmup_steps:
+                dynamic_batch_size = full_batch_size
+            else:
+                candidates = [
+                    self._get_dflash_candidate(
+                        req_num=req_num,
+                        dynamic_batch_size=batch_size,
+                        block_rows=block_rows,
+                    )
+                    for batch_size in self.get_dflash_candidate_batch_sizes(req_num=req_num)
+                ]
+                dynamic_batch_size = self._select_best_candidate(candidates, req_num=req_num)[1]
+        return SpecDecodePlan(
+            dynamic_batch_size=dynamic_batch_size,
+            draft_step=self.mtp_step,
+            pre_draft_step=self.mtp_step,
+        )
+
+    def commit_scheduled_plan(
+        self,
+        *,
+        req_num: int,
+        original_batch_size: int,
+        scheduled_plan: SpecDecodePlan,
+    ) -> SpecDecodePlan:
+        """Commit one preview exactly once when its decode turn consumes it."""
+
+        assert req_num * (self.mtp_step + 1) == original_batch_size
+        self.pre_draft_step = self.mtp_step
+        if req_num <= 0:
+            dynamic_batch_size = 0
+        else:
+            full_batch_size = req_num * (self.mtp_step + 1)
+            if self._should_schedule_full_probe():
+                self._full_probe_pending = True
+            if self._should_force_full_verify(pre_draft_step=self.mtp_step):
+                dynamic_batch_size = full_batch_size
+            else:
+                dynamic_batch_size = min(
+                    max(int(scheduled_plan.dynamic_batch_size), req_num),
+                    full_batch_size,
+                )
+        expected_tokens_per_req = (
+            0.0
+            if req_num <= 0
+            else self._estimate_expected_token_num(
+                req_num=req_num,
+                dynamic_batch_size=dynamic_batch_size,
+                verify_step=self.mtp_step,
+            )
+            / req_num
+        )
+        if req_num > 0:
+            self._record_plan_stats(
+                req_num=req_num,
+                dynamic_batch_size=dynamic_batch_size,
+                draft_step=self.mtp_step,
+                expected_tokens_per_req=expected_tokens_per_req,
+            )
+        return SpecDecodePlan(
+            dynamic_batch_size=dynamic_batch_size,
+            draft_step=self.mtp_step,
+            pre_draft_step=self.mtp_step,
+        )
+
+    def get_dynamic_batch_size(
+        self, req_num: int, original_batch_size: int
+    ) -> Tuple[int, int, int]:
+        assert req_num * (self.mtp_step + 1) == original_batch_size
+        # DFlash never shortens proposal depth. The external target-only
+        # controller may disable DFlash as a mode, but an active DFlash turn
+        # always builds exactly one complete block.
+        pre_draft_step = self.mtp_step
+        self.pre_draft_step = self.mtp_step
+        if req_num == 0:
+            return 0, self.mtp_step, pre_draft_step
+
+        full_batch_size = req_num * (self.mtp_step + 1)
+        block_rows = req_num * self.mtp_step
+        costs_ready = (
+            self.main_model_speeds.has_data()
+            and self.commit_model_speeds.has_data()
+            and self.draft_model_speeds.has_data()
+        )
+        if not costs_ready:
+            return full_batch_size, self.mtp_step, pre_draft_step
+
+        if self._should_schedule_full_probe():
+            self._full_probe_pending = True
+        if self._should_force_full_verify(pre_draft_step=pre_draft_step):
+            dynamic_batch_size = full_batch_size
+        else:
+            candidates = [
+                self._get_dflash_candidate(
+                    req_num=req_num,
+                    dynamic_batch_size=batch_size,
+                    block_rows=block_rows,
+                )
+                for batch_size in self.get_dflash_candidate_batch_sizes(req_num=req_num)
+            ]
+            dynamic_batch_size = self._select_best_candidate(candidates, req_num=req_num)[1]
+
+        expected_tokens_per_req = self._estimate_expected_token_num(
+            req_num=req_num,
+            dynamic_batch_size=dynamic_batch_size,
+            verify_step=self.mtp_step,
+        ) / req_num
+        self._record_plan_stats(
+            req_num=req_num,
+            dynamic_batch_size=dynamic_batch_size,
+            draft_step=self.mtp_step,
+            expected_tokens_per_req=expected_tokens_per_req,
+        )
+        return dynamic_batch_size, self.mtp_step, pre_draft_step
+
+    def _estimate_expected_token_num(
+        self, *, req_num: int, dynamic_batch_size: int, verify_step: int
+    ) -> float:
+        del verify_step
+        # Full-width warmup/probe samples provide the unbiased survival baseline.
+        # Dynamic accepted/verified feedback refines it only after a width bucket
+        # has accumulated enough observations.
+        width_ema = self._get_width_bucket_accept_ratio(
+            req_num=req_num,
+            dynamic_batch_size=dynamic_batch_size,
+            verify_step=self.mtp_step,
+        )
+        if width_ema.get_count() >= 10:
+            return max(float(req_num), min(float(dynamic_batch_size), dynamic_batch_size * width_ema.get()))
+
+        selected_draft_rows = max(0, int(dynamic_batch_size) - int(req_num))
+        full_depth, partial_rows = divmod(selected_draft_rows, int(req_num))
+        expected_tokens = float(req_num)
+        for depth in range(min(full_depth, self.mtp_step)):
+            expected_tokens += req_num * float(self.mtp_len_to_accept_ratio[depth].get())
+        if partial_rows > 0 and full_depth < self.mtp_step:
+            expected_tokens += partial_rows * float(
+                self.mtp_len_to_accept_ratio[full_depth].get()
+            )
+        return max(float(req_num), min(float(dynamic_batch_size), expected_tokens))
+
+    def _get_dflash_candidate(
+        self, *, req_num: int, dynamic_batch_size: int, block_rows: int
+    ) -> Tuple[float, int, float, float, int]:
+        expected_token_num = self._estimate_expected_token_num(
+            req_num=req_num,
+            dynamic_batch_size=dynamic_batch_size,
+            verify_step=self.mtp_step,
+        )
+        total_cost_ms = (
+            self.main_model_speeds.get(dynamic_batch_size)
+            + self.commit_model_speeds.get(dynamic_batch_size)
+            + self.draft_model_speeds.get(block_rows)
+        )
+        return (
+            total_cost_ms / expected_token_num,
+            dynamic_batch_size,
+            expected_token_num / req_num,
+            max(0.0, min(1.0, expected_token_num / dynamic_batch_size)),
+            self.mtp_step,
+        )
+
+
 class DSparkDynamicMTPPlanner(DynamicMTPPlanner):
     """DSpark confidence-scheduled verify-capacity planner."""
 
@@ -1193,6 +1429,9 @@ class _InferCostMsTable:
     def has_data(self) -> bool:
         return len(self.infer_cost_ms_table) > 0
 
+    def has_batch_size(self, batch_size: int) -> bool:
+        return int(batch_size) in self.infer_cost_ms_table
+
     def get(self, batch_size: int) -> float:
         assert batch_size > 0
         batch_size = int(batch_size)
@@ -1287,6 +1526,7 @@ class _EMAValue:
 
 
 __all__ = [
+    "DFlashDynamicMTPPlanner",
     "DSparkDynamicMTPPlanner",
     "DynamicMTPPlanner",
     "Eagle3DynamicMTPPlanner",
