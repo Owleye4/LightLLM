@@ -768,6 +768,16 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="""Whether to enable fused shared experts for supported MoE models. It is auto-enabled when supported.""",
     )
     parser.add_argument(
+        "--dflash_recompute_window",
+        type=int,
+        default=512,
+        help="Recent feature window; 0 retains full history for diagnostics",
+    )
+    parser.add_argument(
+        "--dflash_recompute_sinks", type=int, default=4, help="Number of initial target features to retain"
+    )
+    parser.add_argument("--dflash_recompute_history", type=int, default=128, help="Bottom-k historical feature budget")
+    parser.add_argument(
         "--mtp_mode",
         choices=[
             "vanilla_with_att",
@@ -777,6 +787,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
             "eagle3",
             "dspark",
             "dflash",
+            "dflash_recompute",
             "dflash2",
             None,
         ],
@@ -784,6 +795,7 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         help="""Speculative decoding mode.
         *_with_att and *_no_att select attention or non-attention draft models;
         eagle3 uses autoregressive EAGLE-3 drafting; dflash and dflash2 use block-diffusion drafting;
+        dflash_recompute retains target features and recomputes draft K/V for each block;
         dspark uses semi-autoregressive parallel drafting.""",
     )
     parser.add_argument(

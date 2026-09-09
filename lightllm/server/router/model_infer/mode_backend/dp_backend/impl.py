@@ -33,7 +33,7 @@ class DPChunkedPrefillBackend(ModeBackend):
         # 在 mtp 模式下切换绑定的prefill 和 decode 函数
         spec_mode = get_env_start_args().mtp_mode
         if spec_mode is not None:
-            if spec_mode in ("dspark", "dflash", "dflash2"):
+            if spec_mode in ("dspark", "dflash", "dflash_recompute", "dflash2"):
                 raise NotImplementedError(
                     "DP backend does not support DFlash/DFlash2/DSpark parallel block drafting yet."
                 )

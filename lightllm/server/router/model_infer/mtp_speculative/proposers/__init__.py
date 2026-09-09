@@ -10,6 +10,12 @@ def build_spec_proposer(*, spec_mode: str, backend: "ModeBackend", enable_dynmai
         from lightllm.server.router.model_infer.mtp_speculative.proposers.dspark import DSparkProposer
 
         return DSparkProposer(backend=backend, enable_dynmaic_mtp=enable_dynmaic_mtp)
+    if spec_mode == "dflash_recompute":
+        from lightllm.server.router.model_infer.mtp_speculative.proposers.dflash_recompute import (
+            DFlashRecomputeProposer,
+        )
+
+        return DFlashRecomputeProposer(backend=backend, enable_dynmaic_mtp=enable_dynmaic_mtp)
     if spec_mode == "dflash":
         from lightllm.server.router.model_infer.mtp_speculative.proposers.dflash import DFlashProposer
 

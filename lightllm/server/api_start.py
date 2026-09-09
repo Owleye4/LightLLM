@@ -163,6 +163,11 @@ def _launch_subprocesses(args: StartArgs):
                 f"{sorted(allowed_ep_decode_att_backends)}; flashinfer is not supported."
             )
 
+    if args.mtp_mode == "dflash_recompute":
+        from lightllm.utils.dflash_recompute import validate_feature_recompute
+
+        validate_feature_recompute(args)
+
     # mtp params check
     if args.mtp_mode is not None:
         if args.mtp_draft_model_dir is None:
@@ -170,6 +175,7 @@ def _launch_subprocesses(args: StartArgs):
                 "eagle3",
                 "dspark",
                 "dflash",
+                "dflash_recompute",
                 "dflash2",
             ), f"--mtp_draft_model_dir is required for {args.mtp_mode} mode"
             args.mtp_draft_model_dir = [args.model_dir] * args.mtp_step

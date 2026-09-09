@@ -85,14 +85,12 @@ class DFlashProposer(BaseSpecProposer):
         # target verify 的行布局和 mem_indexes 对应本轮所有被验证 token。
         # 附加 target hidden 后执行一次 draft forward，将这些行提交到 DFlash
         # KV cache；浅副本保证 target_model_input 本身保持不变。
-        verify_draft_input = copy.copy(target_model_input)
-        verify_draft_input.mtp_draft_input_hiddens = target_model_output.mtp_collector.spec_hidden
-        draft_model.forward(verify_draft_input)
+        self._commit_verify(target_model_input, target_model_output, b_req_mtp_start_loc, accept_len)
 
         # 每个请求始终展开完整 block，未被本轮 proposal 返回的 block 尾部仍会
         # 参与 parallel forward。所有临时 KV slot 在 verify 后通过 proposal
         # 统一释放。
-        extra_mem_indexes_cpu = mtp_utils.alloc_mem_indexes(req_num * block_size)
+        scratch_gpu, extra_mem_indexes_cpu = self._allocate_scratch(req_num * block_size)
         block_input_ids = target_next_token_ids.new_full(
             (req_num * block_size,),
             fill_value=draft_model.mask_token_id,
@@ -140,7 +138,7 @@ class DFlashProposer(BaseSpecProposer):
             .repeat_interleave(block_size)
             .contiguous()
         )
-        draft_input.mem_indexes = extra_mem_indexes_cpu.cuda(non_blocking=True)
+        draft_input.mem_indexes = scratch_gpu
         draft_input.mem_indexes_cpu = None
         draft_input.multimodal_params = [{"images": [], "audios": []} for _ in range(draft_input.batch_size)]
         draft_output = draft_model.forward(draft_input)
@@ -153,13 +151,22 @@ class DFlashProposer(BaseSpecProposer):
             extra_mem_indexes_cpu=extra_mem_indexes_cpu,
         )
 
+    def _commit_verify(self, model_input, model_output, starts, accept_len):
+        draft_input = copy.copy(model_input)
+        draft_input.mtp_draft_input_hiddens = model_output.mtp_collector.spec_hidden
+        self.backend.draft_models[0].forward(draft_input)
+
+    def _allocate_scratch(self, token_num):
+        indexes = mtp_utils.alloc_mem_indexes(token_num)
+        return indexes.cuda(non_blocking=True), indexes
+
     def _build_proposal(
         self,
         draft_output: ModelOutput,
         req_num: int,
         block_size: int,
         draft_step: int,
-        extra_mem_indexes_cpu: torch.Tensor,
+        extra_mem_indexes_cpu: torch.Tensor | None,
     ) -> DFlashSpecProposal:
         if self.enable_dynmaic_mtp:
             flat_draft_token_ids, flat_draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
@@ -176,6 +183,10 @@ class DFlashProposer(BaseSpecProposer):
             schedule_scores = block_draft_token_probs[:, :draft_step].float().contiguous()
         return DFlashSpecProposal(
             token_ids=proposal_token_ids,
-            extra_mem_indexes_cpu=[MtpMemIndexesToFree(mem_indexes_cpu=extra_mem_indexes_cpu)],
+            extra_mem_indexes_cpu=(
+                [MtpMemIndexesToFree(mem_indexes_cpu=extra_mem_indexes_cpu)]
+                if extra_mem_indexes_cpu is not None
+                else []
+            ),
             schedule_scores=schedule_scores,
         )

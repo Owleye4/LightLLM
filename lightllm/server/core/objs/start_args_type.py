@@ -183,6 +183,9 @@ class StartArgs:
     ep_redundancy_expert_config_path: Optional[str] = field(default=None)
     auto_update_redundancy_expert: bool = field(default=False)
     enable_fused_shared_experts: bool = field(default=False)
+    dflash_recompute_window: int = field(default=512)
+    dflash_recompute_sinks: int = field(default=4)
+    dflash_recompute_history: int = field(default=128)
     mtp_mode: Optional[str] = field(
         default=None,
         metadata={
@@ -194,6 +197,7 @@ class StartArgs:
                 "eagle3",
                 "dspark",
                 "dflash",
+                "dflash_recompute",
                 "dflash2",
                 None,
             ]

@@ -71,7 +71,12 @@ class BaseAttBackend:
 
     def uses_causal_attention(self) -> bool:
         args = get_env_start_args()
-        is_parallel_block_draft = self.model.is_mtp_draft_model and args.mtp_mode in ("dspark", "dflash", "dflash2")
+        is_parallel_block_draft = self.model.is_mtp_draft_model and args.mtp_mode in (
+            "dspark",
+            "dflash",
+            "dflash_recompute",
+            "dflash2",
+        )
         return not is_parallel_block_draft
 
     def _find_layer_index(
@@ -116,7 +121,6 @@ class AttControl:
 
 @dataclass
 class BasePrefillAttState(ABC):
-
     backend: BaseAttBackend = None
     infer_state: "InferStateInfo" = None
 

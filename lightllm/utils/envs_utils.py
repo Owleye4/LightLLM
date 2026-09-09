@@ -274,6 +274,8 @@ def get_added_mtp_kv_layer_num() -> int:
         return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
     if mtp_mode == "dspark":
         return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
+    if mtp_mode == "dflash_recompute":
+        return 0
     if mtp_mode == "dflash":
         return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
     if mtp_mode == "dflash2":
@@ -293,6 +295,8 @@ def get_mtp_weight_layer_num() -> int:
         return args.mtp_step
     if mtp_mode == "eagle_no_att":
         return 1
+    if mtp_mode == "dflash_recompute":
+        return _get_mtp_draft_backbone_layer_num(args.mtp_draft_model_dir[0])
     return get_added_mtp_kv_layer_num()
 
 

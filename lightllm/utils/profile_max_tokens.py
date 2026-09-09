@@ -22,7 +22,7 @@ def get_available_gpu_memory(world_size):
         tensor = torch.tensor(free_gpu_memory, dtype=torch.float32).to(f"cuda:{get_current_device_id()}")
         torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.MIN)
         free_gpu_memory = tensor.item()
-    return free_gpu_memory / (1024 ** 3)
+    return free_gpu_memory / (1024**3)
 
 
 def get_total_gpu_memory():
@@ -30,7 +30,7 @@ def get_total_gpu_memory():
     Get the total GPU memory of the machine
     """
     total_memory = torch.cuda.get_device_properties(0).total_memory
-    return total_memory / (1024 ** 3)  # Convert to GB
+    return total_memory / (1024**3)  # Convert to GB
 
 
 def get_mtp_adjusted_mem_fraction(
@@ -38,10 +38,11 @@ def get_mtp_adjusted_mem_fraction(
     target_weight_bytes: int,
     target_layer_num: int,
     mtp_layer_num: int,
+    extra_reserved_bytes: int = 0,
 ) -> float:
     mtp_weight_bytes = target_weight_bytes * mtp_layer_num / target_layer_num
     total_gpu_bytes = torch.cuda.get_device_properties(get_current_device_id()).total_memory
-    adjusted_mem_fraction = mem_fraction - mtp_weight_bytes / total_gpu_bytes
+    adjusted_mem_fraction = mem_fraction - (mtp_weight_bytes + extra_reserved_bytes) / total_gpu_bytes
 
     # 不同 rank 的权重分片大小和 GPU 总显存可能不同。取全局最小值，保证所有
     # rank 使用相同且能够安全预留 MTP 权重显存的 KV cache 比例。
@@ -74,11 +75,19 @@ def profile_mtp_weight_memory(model):
     weight_memory_before = torch.cuda.memory_allocated()
     yield
     target_weight_bytes = torch.cuda.memory_allocated() - weight_memory_before
+    feature_bytes = 0
+    if model.args.mtp_mode == "dflash_recompute":
+        from lightllm.utils.dflash_recompute import feature_pool_bytes
+
+        feature_bytes = feature_pool_bytes(
+            model.args, model.config["hidden_size"], torch.tensor([], dtype=model.data_type).element_size()
+        )
     model.mem_fraction = get_mtp_adjusted_mem_fraction(
         mem_fraction=model.mem_fraction,
         target_weight_bytes=target_weight_bytes,
         target_layer_num=model.config["n_layer"],
         mtp_layer_num=get_mtp_weight_layer_num(),
+        extra_reserved_bytes=feature_bytes,
     )
 
 
@@ -118,7 +127,7 @@ def load_model(model_dir, tp_size, data_type):
     )
     # Memory usage after loading the model
     after_memory = torch.cuda.memory_allocated()
-    model_size = (after_memory - before_memory) / (1024 ** 3)  # Convert to GB
+    model_size = (after_memory - before_memory) / (1024**3)  # Convert to GB
     model_size = model_size / 2 * data_type_dict[data_type]
     return model_size
 
@@ -145,7 +154,7 @@ def get_per_kv_cache_size(weight_dir_, tp_size=1, data_type="bf16"):
     per_kv_cache = 2 * n_layer * num_kv_heads * head_dim * data_type_dict[data_type]
     # If using Tensor Parallel, divide by the number of GPUs
     per_kv_cache /= tp_size
-    return per_kv_cache * 1.0 / (1024 ** 3)  # Convert to GB
+    return per_kv_cache * 1.0 / (1024**3)  # Convert to GB
 
 
 def get_total_token_nums(model_dir, tp_size, weight_data_type, kv_data_type, mem_fraction):

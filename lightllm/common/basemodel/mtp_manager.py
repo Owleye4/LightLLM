@@ -16,7 +16,7 @@ class MtpManager:
     _instance: ClassVar[Optional["MtpManager"]] = None
     _CHAINED_DRAFT_MODES = ("vanilla_with_att", "vanilla_no_att")
     _RECURRENT_DRAFT_MODES = ("eagle_with_att", "eagle_no_att", "eagle3")
-    _BLOCK_DRAFT_MODES = ("dspark", "dflash", "dflash2")
+    _BLOCK_DRAFT_MODES = ("dspark", "dflash", "dflash_recompute", "dflash2")
 
     @classmethod
     def get_instance(cls) -> "MtpManager":
