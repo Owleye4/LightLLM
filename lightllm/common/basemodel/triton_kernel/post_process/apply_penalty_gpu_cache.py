@@ -16,6 +16,10 @@ def _fwd_kernel_apply_penalty_cache(
     req_to_frequency_penalty,
     req_to_repetition_penalty,
     req_to_out_token_id_counter,
+    b_mtp_index,
+    req_to_next_token_ids,
+    req_to_next_token_ids_stride,
+    HAS_MTP_PREFIX: tl.constexpr,
     stride_counter_r,
     stride_counter_s,
     vocab_size,
@@ -35,6 +39,11 @@ def _fwd_kernel_apply_penalty_cache(
         mask=mask,
         other=0,
     )
+    if HAS_MTP_PREFIX:
+        mtp_index = tl.load(b_mtp_index + cur_batch)
+        for step in range(1, mtp_index + 1):
+            prefix_token_id = tl.load(req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + step)
+            token_ids_count += (token_ids == prefix_token_id).to(tl.int32)
     row_start_ptr = Logits + cur_batch * stride_logit_b
     cur_offset = row_start_ptr + token_ids
     origin_logits = tl.load(cur_offset, mask=mask, other=0.0)
@@ -89,6 +98,7 @@ def apply_penalty_gpu_cache(
     b_mask_eos_reqs: torch.Tensor,
     eos_ids: torch.Tensor,
     sampling_params_manager: ReqSamplingParamsManager,
+    b_mtp_index: torch.Tensor = None,
 ):
     assert Logits.is_contiguous()
     BLOCK_P = 2048
@@ -104,6 +114,10 @@ def apply_penalty_gpu_cache(
         req_to_frequency_penalty=sampling_params_manager.req_to_frequency_penalty,
         req_to_repetition_penalty=sampling_params_manager.req_to_repetition_penalty,
         req_to_out_token_id_counter=req_to_out_token_id_counter,
+        b_mtp_index=b_mtp_index,
+        req_to_next_token_ids=sampling_params_manager.req_to_next_token_ids,
+        req_to_next_token_ids_stride=sampling_params_manager.req_to_next_token_ids.stride(0),
+        HAS_MTP_PREFIX=b_mtp_index is not None,
         stride_counter_r=req_to_out_token_id_counter.stride(0),
         stride_counter_s=req_to_out_token_id_counter.stride(1),
         vocab_size=vocab_size,

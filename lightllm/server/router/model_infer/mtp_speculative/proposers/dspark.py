@@ -141,7 +141,19 @@ class DSparkProposer(BaseSpecProposer):
         draft_input.multimodal_params = [{"images": [], "audios": []} for _ in range(draft_input.batch_size)]
         draft_output = draft_model.forward(draft_input)
 
-        if draft_output.mtp_collector.draft_token_ids is None:
+        draft_probs = None
+        if self.mtp_reject_sampling:
+            if draft_output.mtp_collector.draft_token_ids is None:
+                flat_draft_token_ids, flat_draft_probs = self.backend._sample_mtp_draft(
+                    draft_output,
+                    draft_input.b_req_idx,
+                    block_size,
+                )
+            else:
+                flat_draft_token_ids = draft_output.mtp_collector.draft_token_ids
+                flat_draft_probs = draft_output.mtp_collector.draft_probs
+            draft_probs = flat_draft_probs.reshape(req_num, block_size, -1)[:, :draft_step].contiguous()
+        elif draft_output.mtp_collector.draft_token_ids is None:
             flat_draft_token_ids = self.backend._gen_argmax_token_ids(draft_output)
         else:
             flat_draft_token_ids = draft_output.mtp_collector.draft_token_ids
@@ -178,5 +190,6 @@ class DSparkProposer(BaseSpecProposer):
         return DSparkSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=draft_probs,
             schedule_scores_cpu=schedule_scores_cpu,
         )

@@ -3,6 +3,8 @@ from typing import Optional
 import torch
 
 from lightllm.common.basemodel.batch_objs import PostLayerOutput
+from lightllm.common.basemodel.triton_kernel.mtp_sampling import sample_mtp_draft
+from lightllm.utils.envs_utils import get_env_start_args
 
 from lightllm.distributed.communication_op import all_gather_into_tensor
 from lightllm.models.qwen3_dflash.infer_struct import Qwen3DFlashInferStateInfo
@@ -23,6 +25,7 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
     def __init__(self, network_config):
         super().__init__(network_config)
         self.block_size_ = network_config["block_size"]
+        self.mtp_reject_sampling = get_env_start_args().mtp_reject_sampling
         self.markov_rank_ = network_config.get("markov_rank", 0)
         self.markov_head_type_ = (network_config.get("markov_head_type") or "").lower()
         self.enable_confidence_head_ = network_config.get("enable_confidence_head", False)
@@ -100,7 +103,10 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
         prev_token_ids = anchor_token_ids
         state = None
         sampled_tokens = []
+        draft_probs_by_step = []
         req_rows = torch.arange(num_reqs, dtype=torch.long, device=local_logits.device)
+        if getattr(self, "mtp_reject_sampling", False):
+            req_idx = infer_state.b_req_idx.reshape(num_reqs, self.block_size_)[:, 0].contiguous()
         for step_idx in range(self.block_size_):
             prev_embeddings = self._markov_prev_embeddings(prev_token_ids, layer_weight)
             state, markov_latent = self._markov_step_latent(
@@ -113,6 +119,30 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
             local_markov_bias = torch.mm(markov_latent.to(dtype=markov_w2.dtype), markov_w2.t())
             local_base_logits = local_logits[:, step_idx :: self.block_size_].permute(1, 0).float()
             local_scores = local_base_logits + local_markov_bias
+            if getattr(self, "mtp_reject_sampling", False):
+                # Markov q depends on the token sampled at the preceding step.
+                # Winners alone cannot represent q, so gather full scores here.
+                if self.tp_world_size_ == 1:
+                    scores = local_scores
+                else:
+                    gathered_scores = self.alloc_tensor(
+                        (self.tp_world_size_ * num_reqs, local_scores.shape[1]),
+                        dtype=torch.float32,
+                    )
+                    all_gather_into_tensor(gathered_scores, local_scores.contiguous(), group=infer_state.dist_group)
+                    scores = (
+                        gathered_scores.view(self.tp_world_size_, num_reqs, -1).permute(1, 0, 2).reshape(num_reqs, -1)
+                    )
+                next_token_ids, draft_probs = sample_mtp_draft(
+                    PostLayerOutput(logits=scores),
+                    req_idx,
+                    infer_state.req_manager.req_sampling_params_manager,
+                )
+                sampled_tokens.append(next_token_ids)
+                draft_probs_by_step.append(draft_probs)
+                prev_token_ids = next_token_ids
+                continue
+
             local_max_values, local_max_indexes = torch.max(local_scores, dim=-1)
             local_token_ids = local_max_indexes + local_start
 
@@ -140,7 +170,10 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
             sampled_tokens.append(next_token_ids)
             prev_token_ids = next_token_ids
 
-        return torch.stack(sampled_tokens, dim=1)
+        tokens = torch.stack(sampled_tokens, dim=1)
+        if getattr(self, "mtp_reject_sampling", False):
+            return tokens, torch.stack(draft_probs_by_step, dim=1).flatten(0, 1)
+        return tokens
 
     def token_forward(
         self,
@@ -171,6 +204,9 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
                 anchor_token_ids=anchor_token_ids,
                 layer_weight=layer_weight,
             )
+            draft_probs = None
+            if getattr(self, "mtp_reject_sampling", False):
+                sampled_tokens, draft_probs = sampled_tokens
             confidence_logits = self.predict_confidence_logits(
                 block_hidden,
                 anchor_token_ids=anchor_token_ids,
@@ -179,6 +215,7 @@ class Qwen3DSparkPostLayerInfer(Qwen3DFlashPostLayerInfer):
             )
             infer_state.hidden_collector.add_mtp_outputs(
                 draft_token_ids=sampled_tokens.reshape(-1),
+                draft_probs=draft_probs,
                 confidence_logits=confidence_logits,
             )
             # Graph unpadding still uses the leading logits dimension when token ids are returned directly.

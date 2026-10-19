@@ -56,10 +56,21 @@ class DpOverlapVanillaNoAttProposer(BaseDpOverlapProposer):
             else None
         )
 
+        proposal_draft_probs = (
+            torch.empty(
+                (sum(req_num_by_batch), draft_step, self.backend.model.vocab_size),
+                dtype=torch.float32,
+                device=target_next_token_ids0.device,
+            )
+            if self.mtp_reject_sampling
+            else None
+        )
+
         if draft_step == 0:
             return VanillaSpecProposal(
                 token_ids=proposal_token_ids,
                 schedule_scores=schedule_scores,
+                draft_probs=proposal_draft_probs,
             )
 
         assert target_next_token_ids0.shape == (target_model_input0.batch_size,)
@@ -123,7 +134,17 @@ class DpOverlapVanillaNoAttProposer(BaseDpOverlapProposer):
 
             draft_outputs = self.backend.draft_models[step]._microbatch_overlap_decode_cuda(*draft_inputs)
             for batch_index, draft_output in enumerate(draft_outputs):
-                if self.enable_dynmaic_mtp:
+                if self.mtp_reject_sampling:
+                    draft_token_ids, draft_probs = self.backend._sample_mtp_draft(
+                        draft_output,
+                        draft_inputs[batch_index].b_req_idx,
+                    )
+                    proposal_row_start = proposal_row_offsets[batch_index]
+                    proposal_row_end = proposal_row_start + req_num_by_batch[batch_index]
+                    proposal_draft_probs[proposal_row_start:proposal_row_end, step] = draft_probs
+                    if self.enable_dynmaic_mtp:
+                        draft_token_probs = draft_probs.amax(dim=-1)
+                elif self.enable_dynmaic_mtp:
                     draft_token_ids, draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
                     draft_token_probs = draft_token_probs.float()
                 else:
@@ -141,4 +162,5 @@ class DpOverlapVanillaNoAttProposer(BaseDpOverlapProposer):
         return VanillaSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=proposal_draft_probs,
         )

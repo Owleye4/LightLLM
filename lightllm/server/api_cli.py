@@ -848,6 +848,12 @@ def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
         For DSpark and DFlash this value is derived from the draft checkpoint block_size.""",
     )
     parser.add_argument(
+        "--mtp_reject_sampling",
+        action="store_true",
+        help="""Enable MTP rejection sampling with min(1, p(x)/q(x)) acceptance
+        and (p-q)+ correction. Disabled by default; retains the existing MTP verification.""",
+    )
+    parser.add_argument(
         "--mtp_dynamic_verify",
         action="store_true",
         help="""Enable dynamic speculative scheduling.""",

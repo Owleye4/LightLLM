@@ -23,6 +23,7 @@ class SpecProposal:
     """
 
     token_ids: torch.Tensor
+    draft_probs: Optional[torch.Tensor] = None
 
 
 class BaseSpecProposer(ABC):
@@ -37,6 +38,7 @@ class BaseSpecProposer(ABC):
     def __init__(self, *, backend: "ModeBackend", enable_dynmaic_mtp: bool) -> None:
         self.backend = backend
         self.enable_dynmaic_mtp = bool(enable_dynmaic_mtp)
+        self.mtp_reject_sampling = bool(getattr(getattr(backend, "args", None), "mtp_reject_sampling", False))
 
     @abstractmethod
     def fill_draft_model_kv_state(

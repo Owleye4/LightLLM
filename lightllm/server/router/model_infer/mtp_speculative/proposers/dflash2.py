@@ -7,7 +7,7 @@ from lightllm.server.router.model_infer.mtp_speculative.proposers.proposal_type 
 
 
 class DFlash2Proposer(DFlashProposer):
-    """Full-block greedy drafting with optional dynamic target verification."""
+    """Full-block selector drafting with optional dynamic target verification."""
 
     def _build_proposal(
         self,
@@ -15,6 +15,7 @@ class DFlash2Proposer(DFlashProposer):
         req_num: int,
         block_size: int,
         draft_step: int,
+        b_req_idx=None,
     ) -> DFlashSpecProposal:
         mtp_collector = draft_output.mtp_collector
         flat_token_ids = mtp_collector.draft_token_ids
@@ -22,15 +23,26 @@ class DFlash2Proposer(DFlashProposer):
         selected_token_ids = flat_token_ids.view(req_num, block_size)[:, 1:]
         assert 0 < draft_step <= block_size - 1
 
+        draft_probs = mtp_collector.draft_probs
+        if draft_probs is not None:
+            draft_probs = draft_probs.view(req_num, block_size, draft_probs.shape[-1])[
+                :, 1 : draft_step + 1
+            ].contiguous()
+
         schedule_scores = None
         if self.enable_dynmaic_mtp:
-            confidence_logits = mtp_collector.confidence_logits
-            if confidence_logits is None:
-                raise RuntimeError("DFlash2 dynamic verify requires selector confidence logits")
-            assert confidence_logits.shape == selected_token_ids.shape
-            schedule_scores = confidence_logits[:, :draft_step].float().sigmoid().clamp(0.01, 0.99).contiguous()
+            if draft_probs is not None:
+                # The score must not depend on the token drawn at this position.
+                schedule_scores = draft_probs.amax(dim=-1).clamp(0.01, 0.99).contiguous()
+            else:
+                confidence_logits = mtp_collector.confidence_logits
+                if confidence_logits is None:
+                    raise RuntimeError("DFlash2 dynamic verify requires selector confidence logits")
+                assert confidence_logits.shape == selected_token_ids.shape
+                schedule_scores = confidence_logits[:, :draft_step].float().sigmoid().clamp(0.01, 0.99).contiguous()
 
         return DFlashSpecProposal(
             token_ids=selected_token_ids[:, :draft_step].contiguous(),
             schedule_scores=schedule_scores,
+            draft_probs=draft_probs,
         )

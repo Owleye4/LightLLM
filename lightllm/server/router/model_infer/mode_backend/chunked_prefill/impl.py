@@ -281,22 +281,21 @@ class ChunkedPrefillBackend(ModeBackend):
         event_pack.notify_post_handle_and_wait_pre_post_handle()
 
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
-            next_token_ids, next_token_logprobs = sample(
-                model_output.logits,
-                run_reqs,
-                self.eos_id,
-                b_mtp_index=model_input.b_mtp_index,
-            )
-            next_token_ranks = self._get_next_token_ranks(model_output.logits, next_token_ids)
-
             b_req_mtp_start_loc = gen_b_req_mtp_start_loc(model_input.b_mtp_index, num_reqs=req_num)
-            mtp_accept_len, accepted_index = mtp_utils.verify_mtp_tokens(
+            (
+                next_token_ids,
+                next_token_logprobs,
+                mtp_accept_len,
+                accepted_index,
+            ) = mtp_utils.sample_and_verify_mtp_tokens(
                 backend=self,
-                next_token_ids=next_token_ids,
+                logits=model_output.logits,
+                run_reqs=run_reqs,
                 b_req_idx=model_input.b_req_idx,
                 b_req_mtp_start_loc=b_req_mtp_start_loc,
                 b_mtp_index=model_input.b_mtp_index,
             )
+            next_token_ranks = self._get_next_token_ranks(model_output.logits, next_token_ids)
             accepted_index_cpu = g_pin_mem_manager.async_copy_from_gpu_tensor(
                 key="accepted_index",
                 gpu_tensor=accepted_index,

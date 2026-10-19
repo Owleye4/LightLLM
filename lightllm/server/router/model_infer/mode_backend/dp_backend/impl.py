@@ -506,26 +506,25 @@ class DPChunkedPrefillBackend(ModeBackend):
 
         with torch.cuda.stream(g_infer_context.get_overlap_stream()):
             if req_num > 0:
-                next_token_ids, next_token_logprobs = sample(
-                    model_output.logits,
-                    run_reqs,
-                    self.eos_id,
-                    b_mtp_index=model_input.b_mtp_index,
-                )
-                next_token_ranks = self._get_next_token_ranks(model_output.logits, next_token_ids)
-
                 b_req_mtp_start_loc = gen_b_req_mtp_start_loc(
                     b_mtp_index=model_input.b_mtp_index,
                     num_reqs=req_num,
                 )
 
-                mtp_accept_len, accepted_index = mtp_utils.verify_mtp_tokens(
+                (
+                    next_token_ids,
+                    next_token_logprobs,
+                    mtp_accept_len,
+                    accepted_index,
+                ) = mtp_utils.sample_and_verify_mtp_tokens(
                     backend=self,
-                    next_token_ids=next_token_ids,
+                    logits=model_output.logits,
+                    run_reqs=run_reqs,
                     b_req_idx=model_input.b_req_idx,
                     b_req_mtp_start_loc=b_req_mtp_start_loc,
                     b_mtp_index=model_input.b_mtp_index,
                 )
+                next_token_ranks = self._get_next_token_ranks(model_output.logits, next_token_ids)
                 accepted_index_cpu = g_pin_mem_manager.async_copy_from_gpu_tensor(
                     key="accepted_index",
                     gpu_tensor=accepted_index,
@@ -780,26 +779,30 @@ class DPChunkedPrefillBackend(ModeBackend):
                 logits[:verify_row_num0, :].copy_(logits0, non_blocking=True)
                 logits[verify_row_num0:, :].copy_(logits1, non_blocking=True)
                 b_mtp_index = torch.cat((model_input0.b_mtp_index, model_input1.b_mtp_index), dim=0)
-                next_token_ids, next_token_logprobs = sample(logits, run_reqs, self.eos_id, b_mtp_index=b_mtp_index)
+                b_req_idx = torch.cat((model_input0.b_req_idx, model_input1.b_req_idx), dim=0)
+                b_req_mtp_start_loc = gen_b_req_mtp_start_loc(
+                    b_mtp_index=b_mtp_index,
+                    num_reqs=req_num,
+                )
+                (
+                    next_token_ids,
+                    next_token_logprobs,
+                    mtp_accept_len,
+                    accepted_index,
+                ) = mtp_utils.sample_and_verify_mtp_tokens(
+                    backend=self,
+                    logits=logits,
+                    run_reqs=run_reqs,
+                    b_req_idx=b_req_idx,
+                    b_req_mtp_start_loc=b_req_mtp_start_loc,
+                    b_mtp_index=b_mtp_index,
+                )
                 next_token_ranks = self._get_next_token_ranks(logits, next_token_ids)
                 (
                     next_token_ids_cpu,
                     next_token_logprobs_cpu,
                     next_token_ranks_cpu,
                 ) = self._async_copy_next_token_infos_to_pin_mem(next_token_ids, next_token_logprobs, next_token_ranks)
-
-                b_req_idx = torch.cat((model_input0.b_req_idx, model_input1.b_req_idx), dim=0)
-                b_req_mtp_start_loc = gen_b_req_mtp_start_loc(
-                    b_mtp_index=b_mtp_index,
-                    num_reqs=req_num,
-                )
-                mtp_accept_len, accepted_index = mtp_utils.verify_mtp_tokens(
-                    backend=self,
-                    next_token_ids=next_token_ids,
-                    b_req_idx=b_req_idx,
-                    b_req_mtp_start_loc=b_req_mtp_start_loc,
-                    b_mtp_index=b_mtp_index,
-                )
                 mtp_accept_len0 = mtp_accept_len[:real_request_num0]
                 mtp_accept_len1 = mtp_accept_len[real_request_num0:]
                 accepted_index_cpu = g_pin_mem_manager.async_copy_from_gpu_tensor(

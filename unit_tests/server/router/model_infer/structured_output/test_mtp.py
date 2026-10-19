@@ -408,7 +408,9 @@ def test_mtp_decode_handoff_compaction_and_accepted_commits(compiler, monkeypatc
         assert result.tolist() == [ord("b"), ord("c"), 256]
         return result, torch.zeros(3)
 
-    monkeypatch.setattr(impl, "sample", sample)
+    from lightllm.server.router.model_infer.mode_backend import generic_post_process
+
+    monkeypatch.setattr(generic_post_process, "sample", sample)
 
     def verify(**kwargs):
         order.append("verify")

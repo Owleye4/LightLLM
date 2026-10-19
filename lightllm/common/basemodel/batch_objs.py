@@ -143,12 +143,16 @@ class ModelMtpOutputCollector:
     # - 固定 verify 且未启用 confidence head 的 DSpark 模型可以返回 None。
     # - Vanilla MTP、EAGLE、EAGLE3、DFlash 以及未启用 MTP 的模型均不使用该字段。
     confidence_logits: Optional[torch.Tensor] = None
+    # Specialized draft head's actual conditional q, [block_token_num, vocab_size].
+    draft_probs: Optional[torch.Tensor] = None
 
     def to_no_ref_tensor(self) -> None:
         if self.spec_hidden is not None:
             self.spec_hidden = tensor_to_no_ref_tensor(self.spec_hidden)
         if self.draft_token_ids is not None:
             self.draft_token_ids = tensor_to_no_ref_tensor(self.draft_token_ids)
+        if self.draft_probs is not None:
+            self.draft_probs = tensor_to_no_ref_tensor(self.draft_probs)
         if self.confidence_logits is not None:
             self.confidence_logits = tensor_to_no_ref_tensor(self.confidence_logits)
 
@@ -158,6 +162,8 @@ class ModelMtpOutputCollector:
             collector.spec_hidden = collector.spec_hidden[:origin_batch_size]
         if collector.draft_token_ids is not None:
             collector.draft_token_ids = collector.draft_token_ids[:origin_batch_size]
+        if collector.draft_probs is not None:
+            collector.draft_probs = collector.draft_probs[:origin_batch_size]
         if collector.confidence_logits is not None:
             confidence_row_count = collector.confidence_logits.shape[0]
             assert confidence_row_count > 0 and padded_batch_size % confidence_row_count == 0

@@ -42,6 +42,73 @@ def verify_mtp_tokens(
     return accept_lengths, accepted_index
 
 
+def sample_and_verify_mtp_tokens(
+    backend: ModeBackend,
+    logits: torch.Tensor,
+    run_reqs: List[InferReq],
+    b_req_idx: torch.Tensor,
+    b_req_mtp_start_loc: torch.Tensor,
+    b_mtp_index: torch.Tensor,
+):
+    """Use the existing verifier by default; opt in to chain rejection sampling."""
+    from lightllm.server.router.model_infer.mode_backend.generic_post_process import sample
+
+    if not getattr(getattr(backend, "args", None), "mtp_reject_sampling", False):
+        next_token_ids, next_token_logprobs = sample(logits, run_reqs, backend.eos_id, b_mtp_index=b_mtp_index)
+        accept_lengths, accepted_index = verify_mtp_tokens(
+            backend=backend,
+            next_token_ids=next_token_ids,
+            b_req_idx=b_req_idx,
+            b_req_mtp_start_loc=b_req_mtp_start_loc,
+            b_mtp_index=b_mtp_index,
+        )
+        return next_token_ids, next_token_logprobs, accept_lengths, accepted_index
+
+    from lightllm.common.basemodel.triton_kernel.mtp_sampling import mtp_reject_sampling
+
+    target_probs, logprob_probs = sample(
+        logits,
+        run_reqs,
+        backend.eos_id,
+        return_probs=True,
+        b_mtp_index=b_mtp_index,
+    )
+    b_verify_uniform = torch.rand_like(b_req_idx, dtype=torch.float32)
+    b_sample_uniform = torch.rand_like(b_req_idx, dtype=torch.float32)
+    for row, req in enumerate(run_reqs):
+        if req.generator is not None:
+            b_verify_uniform[row : row + 1].uniform_(generator=req.generator)
+            b_sample_uniform[row : row + 1].uniform_(generator=req.generator)
+    manager = backend.model.req_manager.req_sampling_params_manager
+    next_token_ids, accept_lengths, accepted_index = mtp_reject_sampling(
+        req_to_next_token_ids=manager.req_to_next_token_ids,
+        req_to_draft_probs=manager.req_to_draft_probs,
+        target_probs=target_probs,
+        b_verify_uniform=b_verify_uniform,
+        b_sample_uniform=b_sample_uniform,
+        b_req_mtp_start_loc=b_req_mtp_start_loc,
+        b_req_idx=b_req_idx,
+    )
+    if backend.args.tp // backend.args.dp > 1:
+        from lightllm.distributed.communication_op import broadcast, dist_group_manager
+        from lightllm.utils.dist_utils import get_global_rank, get_current_rank_in_dp
+
+        # Keep committed prefixes and recurrent state identical across TP ranks.
+        src_rank = get_global_rank() - get_current_rank_in_dp()
+        for tensor in (next_token_ids, accept_lengths, accepted_index):
+            broadcast(tensor, src=src_rank, group=dist_group_manager.get_default_group())
+    if backend.is_hybrid_att_model:
+        backend.model.req_manager.update_mtp_state(
+            b_req_mtp_start_loc=b_req_mtp_start_loc,
+            b_req_idx=b_req_idx,
+            b_mtp_index=b_mtp_index,
+            accepted_index=accepted_index,
+            verify_width=backend.max_draft_step + 1,
+        )
+    next_token_logprobs = logprob_probs.gather(1, next_token_ids[:, None]).view(-1).log()
+    return next_token_ids, next_token_logprobs, accept_lengths, accepted_index
+
+
 def scatter_mtp_next_tokens(
     backend: ModeBackend,
     proposal: SpecProposal,  # proposal.token_ids: [req_num, draft_step]
@@ -76,6 +143,17 @@ def scatter_mtp_next_tokens(
             sampling_params_manager.req_to_next_token_ids, non_blocking=True
         )
 
+    draft_probs = getattr(proposal, "draft_probs", None)
+    if draft_probs is not None:
+        from lightllm.common.basemodel.triton_kernel.mtp_sampling import scatter_mtp_draft_probs
+
+        scatter_mtp_draft_probs(
+            sampling_params_manager.req_to_draft_probs,
+            draft_probs,
+            b_req_mtp_start_loc,
+            b_req_idx,
+        )
+
 
 def record_request_mtp_metrics(
     backend: ModeBackend,
@@ -102,5 +180,6 @@ def record_request_mtp_metrics(
 __all__ = [
     "record_request_mtp_metrics",
     "scatter_mtp_next_tokens",
+    "sample_and_verify_mtp_tokens",
     "verify_mtp_tokens",
 ]

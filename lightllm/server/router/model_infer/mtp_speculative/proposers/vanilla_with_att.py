@@ -60,6 +60,7 @@ class VanillaWithAttProposer(BaseSpecProposer):
         req_num = int(b_req_mtp_start_loc.shape[0])
         proposal_token_ids_by_step = []
         schedule_scores_by_step = []
+        draft_probs_by_step = []
 
         assert not target_model_input.is_prefill
         assert accept_len is not None
@@ -90,15 +91,34 @@ class VanillaWithAttProposer(BaseSpecProposer):
             draft_output = self.backend.draft_models[step].forward(draft_input)
             draft_hidden = draft_output.mtp_collector.spec_hidden
 
-            if self.enable_dynmaic_mtp:
-                # Vanilla With-Att 没有独立的 confidence head；动态调度使用
-                # 当前 draft model 选中 token 的采样概率。
-                draft_token_ids, draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
-                selected_token_probs = draft_token_probs.index_select(0, accepted_tail_rows)
-                schedule_scores_by_step.append(selected_token_probs.float().unsqueeze(1))
-            else:
+            if self.mtp_reject_sampling:
+                accepted_tail_output = ModelOutput(
+                    logits=draft_output.logits.index_select(0, accepted_tail_rows),
+                    logits_token_ids=(
+                        draft_output.logits_token_ids.index_select(0, accepted_tail_rows)
+                        if draft_output.logits_token_ids is not None
+                        else None
+                    ),
+                )
+                selected_token_ids, draft_probs = self.backend._sample_mtp_draft(
+                    accepted_tail_output,
+                    target_model_input.b_req_idx.index_select(0, accepted_tail_rows),
+                )
+                draft_probs_by_step.append(draft_probs)
                 draft_token_ids = self.backend._gen_argmax_token_ids(draft_output)
-            selected_token_ids = draft_token_ids.index_select(0, accepted_tail_rows)
+                draft_token_ids.index_copy_(0, accepted_tail_rows, selected_token_ids)
+                if self.enable_dynmaic_mtp:
+                    schedule_scores_by_step.append(draft_probs.amax(dim=-1, keepdim=True))
+            else:
+                if self.enable_dynmaic_mtp:
+                    # Vanilla With-Att 没有独立的 confidence head；动态调度使用
+                    # 当前 draft model 选中 token 的采样概率。
+                    draft_token_ids, draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
+                    selected_token_probs = draft_token_probs.index_select(0, accepted_tail_rows)
+                    schedule_scores_by_step.append(selected_token_probs.float().unsqueeze(1))
+                else:
+                    draft_token_ids = self.backend._gen_argmax_token_ids(draft_output)
+                selected_token_ids = draft_token_ids.index_select(0, accepted_tail_rows)
             proposal_token_ids_by_step.append(selected_token_ids.unsqueeze(1))
 
             if step + 1 < draft_step:
@@ -117,6 +137,7 @@ class VanillaWithAttProposer(BaseSpecProposer):
         return VanillaSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=torch.stack(draft_probs_by_step, dim=1) if self.mtp_reject_sampling else None,
         )
 
     def _prepare_mtp_prefill_inputs(

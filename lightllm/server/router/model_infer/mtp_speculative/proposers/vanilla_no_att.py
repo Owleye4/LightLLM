@@ -31,6 +31,7 @@ class VanillaNoAttProposer(BaseSpecProposer):
         req_num = int(b_req_mtp_start_loc.shape[0])
         proposal_token_ids_by_step = []
         schedule_scores_by_step = []
+        draft_probs_by_step = []
 
         if draft_step == 0:
             return VanillaSpecProposal(
@@ -78,7 +79,13 @@ class VanillaNoAttProposer(BaseSpecProposer):
             draft_output = self.backend.draft_models[step].forward(draft_input)
             draft_hidden = draft_output.mtp_collector.spec_hidden
 
-            if self.enable_dynmaic_mtp:
+            if self.mtp_reject_sampling:
+                draft_token_ids, draft_probs = self.backend._sample_mtp_draft(draft_output, draft_input.b_req_idx)
+                draft_probs_by_step.append(draft_probs)
+                if self.enable_dynmaic_mtp:
+                    draft_token_probs = draft_probs.amax(dim=-1)
+                    schedule_scores_by_step.append(draft_token_probs.unsqueeze(1))
+            elif self.enable_dynmaic_mtp:
                 # Vanilla No-Att 没有独立的 confidence head；动态调度使用
                 # 当前 draft model 选中 token 的采样概率。
                 draft_token_ids, draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
@@ -92,4 +99,5 @@ class VanillaNoAttProposer(BaseSpecProposer):
         return VanillaSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=torch.stack(draft_probs_by_step, dim=1) if self.mtp_reject_sampling else None,
         )

@@ -142,6 +142,7 @@ class DFlashProposer(BaseSpecProposer):
             req_num=req_num,
             block_size=block_size,
             draft_step=draft_step,
+            b_req_idx=draft_input.b_req_idx,
         )
 
     def _build_proposal(
@@ -150,8 +151,15 @@ class DFlashProposer(BaseSpecProposer):
         req_num: int,
         block_size: int,
         draft_step: int,
+        b_req_idx: torch.Tensor = None,
     ) -> DFlashSpecProposal:
-        if self.enable_dynmaic_mtp:
+        draft_probs = None
+        if self.mtp_reject_sampling:
+            flat_draft_token_ids, flat_draft_probs = self.backend._sample_mtp_draft(draft_output, b_req_idx, block_size)
+            draft_probs = flat_draft_probs.reshape(req_num, block_size, -1)[:, :draft_step].contiguous()
+            if self.enable_dynmaic_mtp:
+                flat_draft_token_probs = flat_draft_probs.amax(dim=-1)
+        elif self.enable_dynmaic_mtp:
             flat_draft_token_ids, flat_draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(draft_output)
         else:
             flat_draft_token_ids = self.backend._gen_argmax_token_ids(draft_output)
@@ -167,4 +175,5 @@ class DFlashProposer(BaseSpecProposer):
         return DFlashSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=draft_probs,
         )

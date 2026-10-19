@@ -54,6 +54,7 @@ class EagleWithAttProposer(BaseSpecProposer):
         req_num = int(b_req_mtp_start_loc.shape[0])
         proposal_token_ids_by_step = []
         schedule_scores_by_step = []
+        draft_probs_by_step = []
 
         assert draft_step > 0, "EAGLE attention requires draft_step to be greater than 0 to maintain draft KV state"
         assert not target_model_input.is_prefill
@@ -85,7 +86,15 @@ class EagleWithAttProposer(BaseSpecProposer):
                 else None
             ),
         )
-        if self.enable_dynmaic_mtp:
+        if self.mtp_reject_sampling:
+            draft_token_ids, draft_probs = self.backend._sample_mtp_draft(
+                accepted_tail_output,
+                target_model_input.b_req_idx.index_select(0, accepted_tail_rows),
+            )
+            draft_probs_by_step.append(draft_probs)
+            if self.enable_dynmaic_mtp:
+                schedule_scores_by_step.append(draft_probs.amax(dim=-1, keepdim=True))
+        elif self.enable_dynmaic_mtp:
             draft_token_ids, draft_token_probs = self._gen_argmax_token_ids_and_prob(accepted_tail_output)
             schedule_scores_by_step.append(draft_token_probs.float().unsqueeze(1))
         else:
@@ -95,6 +104,7 @@ class EagleWithAttProposer(BaseSpecProposer):
         if draft_step == 1:
             return EagleSpecProposal(
                 token_ids=torch.cat(proposal_token_ids_by_step, dim=1),
+                draft_probs=torch.stack(draft_probs_by_step, dim=1) if self.mtp_reject_sampling else None,
                 schedule_scores=torch.cat(schedule_scores_by_step, dim=1) if self.enable_dynmaic_mtp else None,
             )
 
@@ -142,7 +152,12 @@ class EagleWithAttProposer(BaseSpecProposer):
             draft_output = draft_model.forward(draft_input)
             draft_hidden = draft_output.mtp_collector.spec_hidden
 
-            if self.enable_dynmaic_mtp:
+            if self.mtp_reject_sampling:
+                draft_token_ids, draft_probs = self.backend._sample_mtp_draft(draft_output, draft_input.b_req_idx)
+                draft_probs_by_step.append(draft_probs)
+                if self.enable_dynmaic_mtp:
+                    schedule_scores_by_step.append(draft_probs.amax(dim=-1, keepdim=True))
+            elif self.enable_dynmaic_mtp:
                 draft_token_ids, draft_token_probs = self._gen_argmax_token_ids_and_prob(draft_output)
                 schedule_scores_by_step.append(draft_token_probs.float().unsqueeze(1))
             else:
@@ -155,6 +170,7 @@ class EagleWithAttProposer(BaseSpecProposer):
         return EagleSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=torch.stack(draft_probs_by_step, dim=1) if self.mtp_reject_sampling else None,
         )
 
     def _gen_argmax_token_ids(self, model_output: ModelOutput) -> torch.Tensor:

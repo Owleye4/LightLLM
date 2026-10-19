@@ -18,7 +18,7 @@ from lightllm.common.basemodel.moe_route_info_manager import MoeRouteInfoManager
 from lightllm.common.req_manager import HybridAttentionReqManager
 from lightllm.server.router.dynamic_prompt.hybrid_att_radix_cache import HybridAttPagedRadixCache
 from lightllm.server.router.dynamic_prompt.radix_cache import RadixCache
-from lightllm.common.basemodel.batch_objs import ModelOutput, ModelInput
+from lightllm.common.basemodel.batch_objs import ModelOutput, ModelInput, PostLayerOutput
 from lightllm.utils.dist_utils import init_distributed_env
 from lightllm.server.core.objs import ShmReqManager, StartArgs
 from lightllm.server.core.objs.io_objs import AbortedReqCmd
@@ -938,6 +938,28 @@ class ModeBackend:
         probs = torch.softmax(logits, dim=-1)
         max_probs, draft_next_token_ids_gpu = torch.max(probs, dim=-1)
         return draft_next_token_ids_gpu, max_probs
+
+    def _sample_mtp_draft(self, model_output: ModelOutput, b_req_idx: torch.Tensor, block_size: int = 1):
+        from lightllm.common.basemodel.triton_kernel.mtp_sampling import sample_mtp_draft
+
+        if self.args.mtp_mode == "eagle3":
+            draft_token_ids = model_output.logits_token_ids
+            if draft_token_ids is None:
+                draft_token_ids = torch.arange(
+                    model_output.logits.shape[-1], dtype=torch.int64, device=model_output.logits.device
+                )
+            target_token_ids = self.draft_models[0].map_draft_vocab_to_main_vocab(draft_token_ids)
+            # Let the shared sampler expand q directly into the target vocabulary.
+            model_output = PostLayerOutput(
+                logits=model_output.logits,
+                logits_token_ids=target_token_ids.expand_as(model_output.logits),
+            )
+        return sample_mtp_draft(
+            model_output,
+            b_req_idx,
+            self.model.req_manager.req_sampling_params_manager,
+            block_size,
+        )
 
     def _sample_and_scatter_token(
         self,

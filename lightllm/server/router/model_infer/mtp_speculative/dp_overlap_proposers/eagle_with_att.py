@@ -121,6 +121,16 @@ class DpOverlapEagleWithAttProposer(BaseDpOverlapProposer):
             else None
         )
 
+        proposal_draft_probs = (
+            torch.empty(
+                (sum(req_num_by_batch), draft_step, self.backend.model.vocab_size),
+                dtype=torch.float32,
+                device=target_next_token_ids0.device,
+            )
+            if self.mtp_reject_sampling
+            else None
+        )
+
         draft_model = self.backend.draft_models[0]
         extend_outputs = draft_model._microbatch_overlap_decode_cuda(*model_inputs)
         draft_token_ids_by_batch = []
@@ -147,7 +157,17 @@ class DpOverlapEagleWithAttProposer(BaseDpOverlapProposer):
                     else None
                 ),
             )
-            if self.enable_dynmaic_mtp:
+            if self.mtp_reject_sampling:
+                draft_token_ids, draft_probs = self.backend._sample_mtp_draft(
+                    accepted_tail_output,
+                    model_input.b_req_idx.index_select(0, accepted_tail_rows),
+                )
+                proposal_row_start = proposal_row_offsets[batch_index]
+                proposal_row_end = proposal_row_start + batch_req_num
+                proposal_draft_probs[proposal_row_start:proposal_row_end, 0] = draft_probs
+                if self.enable_dynmaic_mtp:
+                    draft_token_probs = draft_probs.amax(dim=-1)
+            elif self.enable_dynmaic_mtp:
                 draft_token_ids, draft_token_probs = self._gen_argmax_token_ids_and_prob(accepted_tail_output)
                 draft_token_probs = draft_token_probs.float()
             else:
@@ -172,6 +192,7 @@ class DpOverlapEagleWithAttProposer(BaseDpOverlapProposer):
             return EagleSpecProposal(
                 token_ids=proposal_token_ids,
                 schedule_scores=schedule_scores,
+                draft_probs=proposal_draft_probs,
             )
 
         for batch_index, model_input in enumerate(model_inputs):
@@ -198,7 +219,17 @@ class DpOverlapEagleWithAttProposer(BaseDpOverlapProposer):
 
             draft_outputs = draft_model._microbatch_overlap_decode_cuda(*model_inputs)
             for batch_index, draft_output in enumerate(draft_outputs):
-                if self.enable_dynmaic_mtp:
+                if self.mtp_reject_sampling:
+                    draft_token_ids, draft_probs = self.backend._sample_mtp_draft(
+                        draft_output,
+                        model_inputs[batch_index].b_req_idx,
+                    )
+                    proposal_row_start = proposal_row_offsets[batch_index]
+                    proposal_row_end = proposal_row_start + req_num_by_batch[batch_index]
+                    proposal_draft_probs[proposal_row_start:proposal_row_end, step] = draft_probs
+                    if self.enable_dynmaic_mtp:
+                        draft_token_probs = draft_probs.amax(dim=-1)
+                elif self.enable_dynmaic_mtp:
                     draft_token_ids, draft_token_probs = self._gen_argmax_token_ids_and_prob(draft_output)
                     draft_token_probs = draft_token_probs.float()
                 else:
@@ -217,6 +248,7 @@ class DpOverlapEagleWithAttProposer(BaseDpOverlapProposer):
         return EagleSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=schedule_scores,
+            draft_probs=proposal_draft_probs,
         )
 
     def _gen_argmax_token_ids(self, model_output: ModelOutput) -> torch.Tensor:

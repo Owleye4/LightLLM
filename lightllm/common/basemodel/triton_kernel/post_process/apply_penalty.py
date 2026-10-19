@@ -21,6 +21,10 @@ def _fwd_kernel_apply_penalty(
     p_cumsum_seq_len,
     eos_ids,
     b_mask_eos_reqs,
+    b_mtp_index,
+    req_to_next_token_ids,
+    req_to_next_token_ids_stride,
+    HAS_MTP_PREFIX: tl.constexpr,
     vocab_size,
     BLOCK_P: tl.constexpr,
     EOS_ID_NUM: tl.constexpr,
@@ -40,6 +44,12 @@ def _fwd_kernel_apply_penalty(
             p_token_counts + cur_batch_id_offset, mask=cur_batch_id_offset < cur_batch_end_index, other=0
         )
 
+        if HAS_MTP_PREFIX:
+            mtp_index = tl.load(b_mtp_index + cur_batch)
+            for step in range(1, mtp_index + 1):
+                prefix_token_id = tl.load(req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + step)
+                token_ids_count += (token_ids == prefix_token_id).to(tl.int32)
+
         row_start_ptr = Logits + cur_batch * stride_logit_b
         cur_offset = row_start_ptr + token_ids
         cur_logits = tl.load(
@@ -50,6 +60,29 @@ def _fwd_kernel_apply_penalty(
         pre_logits = freq_logits - cur_presence
         output_ptr = Logits + cur_batch * stride_logit_b + token_ids
         tl.store(output_ptr, pre_logits, mask=(cur_batch_id_offset < cur_batch_end_index) & (token_ids < vocab_size))
+
+    if HAS_MTP_PREFIX:
+        # Tokens already in CPU history were handled above. Apply penalties to
+        # new prefix tokens once, using their total count in this verify row.
+        mtp_index = tl.load(b_mtp_index + cur_batch)
+        for step in range(1, mtp_index + 1):
+            token_id = tl.load(req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + step)
+            in_history = False
+            for start_index in range(cur_batch_start_index, cur_batch_end_index, BLOCK_P):
+                offsets = start_index + tl.arange(0, BLOCK_P)
+                history_ids = tl.load(p_token_ids + offsets, offsets < cur_batch_end_index, other=-1)
+                in_history |= tl.sum((history_ids == token_id).to(tl.int32)) > 0
+            prefix_count = 0
+            first_occurrence = True
+            for prefix_step in range(1, mtp_index + 1):
+                prefix_id = tl.load(req_to_next_token_ids + cur_req_idx * req_to_next_token_ids_stride + prefix_step)
+                prefix_count += (prefix_id == token_id).to(tl.int32)
+                first_occurrence &= (prefix_step >= step) | (prefix_id != token_id)
+            if first_occurrence & ~in_history:
+                logit_ptr = Logits + cur_batch * stride_logit_b + token_id * stride_logit_s
+                logit = tl.load(logit_ptr)
+                logit = tl.where(logit > 0, logit / cur_repetition, logit * cur_repetition)
+                tl.store(logit_ptr, logit - prefix_count * cur_freqency - cur_presence)
 
     mask_eos = tl.load(b_mask_eos_reqs + cur_batch)
     exponential_decay_length_penalty = tl.load(req_to_exponential_decay_length_penalty + cur_req_idx)
@@ -77,6 +110,7 @@ def apply_penalty(
     p_cumsum_seq_len: torch.Tensor,
     eos_ids: torch.Tensor,
     sampling_params_manager: ReqSamplingParamsManager,
+    b_mtp_index: torch.Tensor = None,
 ):
     assert Logits.is_contiguous()
     BLOCK_P = 1024
@@ -96,6 +130,10 @@ def apply_penalty(
         p_cumsum_seq_len=p_cumsum_seq_len,
         eos_ids=eos_ids,
         b_mask_eos_reqs=b_mask_eos_reqs,
+        b_mtp_index=b_mtp_index,
+        req_to_next_token_ids=sampling_params_manager.req_to_next_token_ids,
+        req_to_next_token_ids_stride=sampling_params_manager.req_to_next_token_ids.stride(0),
+        HAS_MTP_PREFIX=b_mtp_index is not None,
         vocab_size=sampling_params_manager.vocab_size,
         num_warps=num_warps,
         BLOCK_P=BLOCK_P,

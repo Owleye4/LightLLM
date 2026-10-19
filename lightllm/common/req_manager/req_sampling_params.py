@@ -50,6 +50,19 @@ class ReqSamplingParamsManager:
             else None
         )
 
+        # Keep q in the same request slots as the existing candidate tokens.
+        # Allocate only for rejection sampling; draft models share this manager.
+        self.req_to_draft_probs = None
+        if getattr(get_env_start_args(), "mtp_reject_sampling", False):
+            self.req_to_draft_probs = torch.empty(
+                (max_request_num + 1, self.mtp_verify_width - 1, self.vocab_size),
+                dtype=torch.float32,
+                device="cuda",
+            )
+            self.req_to_mtp_temperature = torch.ones(max_request_num + 1, device="cuda")
+            self.req_to_mtp_top_k = torch.zeros(max_request_num + 1, dtype=torch.int32, device="cuda")
+            self.req_to_mtp_seed = torch.zeros(max_request_num + 1, dtype=torch.int64, device="cuda")
+            self.req_to_mtp_sample_offset = torch.zeros(max_request_num + 1, dtype=torch.int64, device="cuda")
         self.req_to_bitmask: Optional[torch.Tensor] = None
         self.req_to_bitmask_enabled: Optional[torch.Tensor] = None
         if get_env_start_args().output_constraint_mode == "xgrammar":
@@ -84,6 +97,17 @@ class ReqSamplingParamsManager:
         if self.req_to_next_token_scores is not None:
             self.req_to_next_token_scores[req.req_idx].fill_(0.0)
             self.req_to_next_token_scores[req.req_idx][0:1].fill_(1.0)
+        if self.req_to_draft_probs is not None:
+            # A fresh/resumed request has no draft proposal on its first decode.
+            self.req_to_draft_probs[req.req_idx].zero_()
+            self.req_to_mtp_temperature[req.req_idx].fill_(shm_param.temperature)
+            self.req_to_mtp_top_k[req.req_idx].fill_(shm_param.top_k)
+            if shm_param.seed != -1:
+                # Use a distinct Philox key for draft sampling while preserving seed reproducibility.
+                self.req_to_mtp_seed[req.req_idx].fill_(shm_param.seed ^ (1 << 32))
+            else:
+                self.req_to_mtp_seed[req.req_idx].random_(0, 2147483647)
+            self.req_to_mtp_sample_offset[req.req_idx].zero_()
         self.req_to_presence_penalty[req.req_idx].fill_(shm_param.presence_penalty)
         self.req_to_frequency_penalty[req.req_idx].fill_(shm_param.frequency_penalty)
         self.req_to_repetition_penalty[req.req_idx].fill_(shm_param.repetition_penalty)

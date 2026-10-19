@@ -15,8 +15,11 @@ def sample(
     eos_id: List[int] = [2],
     has_output=None,
     b_mtp_index: Optional[torch.Tensor] = None,
+    return_probs: bool = False,
 ):
     sampling_params_manager = g_infer_context.req_manager.req_sampling_params_manager
+    # Verify positions select grammar masks; rejection probabilities also count the tentative prefix.
+    b_penalty_mtp_index = b_mtp_index if return_probs else None
     (
         b_req_idx,
         b_temperatures,
@@ -32,7 +35,7 @@ def sample(
         skip_top_p,
         exist_req_use_random_seed,
         has_output_constraints,
-    ) = _get_post_sample_tensors(reqs, sampling_params_manager, has_output)
+    ) = _get_post_sample_tensors(reqs, sampling_params_manager, has_output, b_mtp_index=b_penalty_mtp_index)
     eos_ids = g_pin_mem_manager.gen_from_list(key="eos_ids", data=eos_id, dtype=torch.int32).cuda(non_blocking=True)
 
     # 这里需要区分历史token的频率惩罚类的系数的生效模式，目前支持两种在线统计方式:
@@ -64,6 +67,7 @@ def sample(
             p_cumsum_seq_len=p_cumsum_seq_len,
             eos_ids=eos_ids,
             sampling_params_manager=sampling_params_manager,
+            b_mtp_index=b_penalty_mtp_index,
         )
     else:
         apply_penalty_gpu_cache(
@@ -73,6 +77,7 @@ def sample(
             b_mask_eos_reqs=b_mask_eos_reqs,
             eos_ids=eos_ids,
             sampling_params_manager=sampling_params_manager,
+            b_mtp_index=b_penalty_mtp_index,
         )
 
     if has_invalid_token_ids:
@@ -96,6 +101,19 @@ def sample(
             b_mtp_index=b_mtp_index,
         )
     probs = torch.softmax(logits, dim=-1)
+
+    if return_probs:
+        # Rejection acceptance uses the normalized sampling distribution.
+        # Keep pre-filter probabilities for LightLLM's existing logprob semantics.
+        if is_all_greedy:
+            sampling_probs = torch.zeros_like(probs).scatter_(1, logits.argmax(dim=-1, keepdim=True), 1.0)
+        elif skip_top_k and skip_top_p:
+            sampling_probs = probs
+        else:
+            probs_sort, probs_idx = _top_p_top_k(probs, b_top_ps, b_top_ks)
+            probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+            sampling_probs = torch.zeros_like(probs).scatter_(1, probs_idx, probs_sort)
+        return sampling_probs, probs
 
     if is_all_greedy:
         batch_next_token_ids = torch.argmax(logits, -1)
@@ -173,7 +191,9 @@ def _random_sample(probs: torch.Tensor, reqs: List[InferReq], exist_req_use_rand
     return probs.div(q).argmax(dim=-1).view(-1)
 
 
-def _get_post_sample_tensors(reqs: List[InferReq], sampling_params_manager, has_output=None):
+def _get_post_sample_tensors(
+    reqs: List[InferReq], sampling_params_manager, has_output=None, b_mtp_index: Optional[torch.Tensor] = None
+):
     """Collect per-logit sampling parameters and fill each request's masks once."""
     req_idxes: List[int] = []
     temperatures: List[float] = []
@@ -181,6 +201,7 @@ def _get_post_sample_tensors(reqs: List[InferReq], sampling_params_manager, has_
     top_ks: List[int] = []
     length_penalty_param: List[int] = []
     mask_eos_reqs: List[bool] = []
+    mtp_min_new_tokens_remaining: List[int] = []
     is_all_greedy = True
     skip_top_k = True
     skip_top_p = True
@@ -206,8 +227,12 @@ def _get_post_sample_tensors(reqs: List[InferReq], sampling_params_manager, has_
         shm_param = sample_param.shm_param
         exponential_decay_length_penalty = shm_param.exponential_decay_length_penalty.to_tuple()
         out_token_len = req_obj.get_cur_total_len() - req_obj.shm_req.input_len
-        length_penalty_param.append(max(out_token_len - exponential_decay_length_penalty[0], 0))
-        mask_eos_reqs.append(out_token_len < shm_param.min_new_tokens - 1)
+        if b_mtp_index is None:
+            length_penalty_param.append(max(out_token_len - exponential_decay_length_penalty[0], 0))
+            mask_eos_reqs.append(out_token_len < shm_param.min_new_tokens - 1)
+        else:
+            length_penalty_param.append(out_token_len - exponential_decay_length_penalty[0])
+            mtp_min_new_tokens_remaining.append(shm_param.min_new_tokens - 1 - out_token_len)
 
         temperatures.append(shm_param.temperature)
         top_ps.append(shm_param.top_p)
@@ -235,7 +260,16 @@ def _get_post_sample_tensors(reqs: List[InferReq], sampling_params_manager, has_
     length_penalty_param_cpu = g_pin_mem_manager.gen_from_list(
         key="length_penalty_param", data=length_penalty_param, dtype=torch.int32
     )
-    mask_eos_reqs_cpu = g_pin_mem_manager.gen_from_list(key="mask_eos_reqs", data=mask_eos_reqs, dtype=torch.bool)
+    length_penalty_param_gpu = length_penalty_param_cpu.cuda(non_blocking=True)
+    if b_mtp_index is None:
+        mask_eos_reqs_cpu = g_pin_mem_manager.gen_from_list(key="mask_eos_reqs", data=mask_eos_reqs, dtype=torch.bool)
+        mask_eos_reqs_gpu = mask_eos_reqs_cpu.cuda(non_blocking=True)
+    else:
+        mtp_min_new_tokens_remaining_cpu = g_pin_mem_manager.gen_from_list(
+            key="mtp_min_new_tokens_remaining", data=mtp_min_new_tokens_remaining, dtype=torch.int32
+        )
+        length_penalty_param_gpu = (length_penalty_param_gpu + b_mtp_index).clamp_min_(0)
+        mask_eos_reqs_gpu = b_mtp_index < mtp_min_new_tokens_remaining_cpu.cuda(non_blocking=True)
 
     if has_invalid_token_ids:
         invalid_token_ids_cpu = g_pin_mem_manager.gen_from_list(
@@ -250,8 +284,8 @@ def _get_post_sample_tensors(reqs: List[InferReq], sampling_params_manager, has_
         temperatures_cpu.cuda(non_blocking=True),
         top_ps_cpu.cuda(non_blocking=True),
         top_ks_cpu.cuda(non_blocking=True),
-        length_penalty_param_cpu.cuda(non_blocking=True),
-        mask_eos_reqs_cpu.cuda(non_blocking=True),
+        length_penalty_param_gpu,
+        mask_eos_reqs_gpu,
         invalid_token_ids_cpu.cuda(non_blocking=True) if has_invalid_token_ids else None,
         cu_invalid_token_num_cpu.cuda(non_blocking=True) if has_invalid_token_ids else None,
         is_all_greedy,

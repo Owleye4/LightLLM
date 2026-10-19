@@ -112,6 +112,16 @@ class DpOverlapVanillaWithAttProposer(BaseDpOverlapProposer):
             if self.enable_dynmaic_mtp
             else None
         )
+        proposal_draft_probs = (
+            torch.empty(
+                (sum(req_num_by_batch), draft_step, self.backend.model.vocab_size),
+                dtype=torch.float32,
+                device=target_next_token_ids0.device,
+            )
+            if self.mtp_reject_sampling
+            else None
+        )
+
         req_offset = req_num_by_batch[0]
 
         for step in range(draft_step):
@@ -122,7 +132,28 @@ class DpOverlapVanillaWithAttProposer(BaseDpOverlapProposer):
             draft_outputs = self.backend.draft_models[step]._microbatch_overlap_decode_cuda(*model_inputs)
             for batch_index, draft_output in enumerate(draft_outputs):
                 draft_hiddens[batch_index] = draft_output.mtp_collector.spec_hidden
-                if self.enable_dynmaic_mtp:
+                if self.mtp_reject_sampling:
+                    tail_rows = accepted_tail_rows[batch_index].long()
+                    accepted_tail_output = ModelOutput(
+                        logits=draft_output.logits.index_select(0, tail_rows),
+                        logits_token_ids=(
+                            draft_output.logits_token_ids.index_select(0, tail_rows)
+                            if draft_output.logits_token_ids is not None
+                            else None
+                        ),
+                    )
+                    selected_token_ids, draft_probs = self.backend._sample_mtp_draft(
+                        accepted_tail_output,
+                        model_inputs[batch_index].b_req_idx.index_select(0, tail_rows),
+                    )
+                    draft_token_ids[batch_index] = self.backend._gen_argmax_token_ids(draft_output)
+                    draft_token_ids[batch_index].index_copy_(0, tail_rows, selected_token_ids)
+                    proposal_row_start = 0 if batch_index == 0 else req_offset
+                    proposal_row_end = proposal_row_start + req_num_by_batch[batch_index]
+                    proposal_draft_probs[proposal_row_start:proposal_row_end, step] = draft_probs
+                    if self.enable_dynmaic_mtp:
+                        proposal_schedule_scores[proposal_row_start:proposal_row_end, step] = draft_probs.amax(dim=-1)
+                elif self.enable_dynmaic_mtp:
                     draft_token_ids[batch_index], draft_token_probs = self.backend._gen_argmax_token_ids_and_prob(
                         draft_output
                     )
@@ -153,6 +184,7 @@ class DpOverlapVanillaWithAttProposer(BaseDpOverlapProposer):
         return VanillaSpecProposal(
             token_ids=proposal_token_ids,
             schedule_scores=proposal_schedule_scores,
+            draft_probs=proposal_draft_probs,
         )
 
     def _prepare_mtp_prefill_inputs(

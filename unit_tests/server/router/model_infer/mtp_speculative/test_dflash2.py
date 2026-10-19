@@ -102,7 +102,7 @@ def test_dflash2_post_layer_satisfies_base_model_output_contract(is_prefill):
     layer._norm = lambda x, *_: x
     layer._compute_candidates = lambda **_: (ids, unary)
     confidence = torch.randn(1, 3)
-    layer._select_path = lambda **_: (selected, confidence)
+    layer._select_path = lambda **_: (selected, confidence, None)
     collected = {}
     state = SimpleNamespace(
         is_prefill=is_prefill,
